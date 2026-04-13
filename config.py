@@ -18,6 +18,12 @@ DEFAULT_CONFIG = {
     'campaign_time_window_minutes': 30,
     'campaign_simhash_distance':    5,
 
+    # Narrative clustering (semantic coordination detection)
+    'narrative_time_window_hours':   6,    # time window for clustering
+    'narrative_min_keyword_overlap': 3,    # shared keywords required
+    'narrative_min_sources':         3,    # distinct accounts (per-platform)
+    'narrative_min_platforms':       2,    # distinct platforms (cross-platform)
+
     # Collector caps
     'collector_post_cap':   500,
     'fourchan_post_cap':    1000,

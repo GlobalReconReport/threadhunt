@@ -27,6 +27,7 @@ def check_all(conn) -> int:
     total = 0
     total += check_new_campaigns(conn)
     total += check_cross_platform_amplification(conn)
+    total += check_narrative_alignment(conn)
     total += check_high_bot_scores(conn)
     total += check_scheduled_accounts(conn)
     total += check_narrative_reemergence(conn)
@@ -53,6 +54,11 @@ def check_new_campaigns(conn) -> int:
               WHERE a.alert_type = 'coordinated_campaign'
                 AND a.keyword = c.keyword
                 AND a.platform = c.platform
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM clusters cl
+              WHERE cl.campaign_id = c.id
+                AND cl.cluster_key LIKE 'narrative_%'
           )
         ORDER BY c.confidence_score DESC
         LIMIT 50
@@ -167,7 +173,109 @@ def check_cross_platform_amplification(conn) -> int:
     return new_alerts
 
 
-# ── Trigger 2b: Scheduled posting pattern ────────────────────────────────────
+# ── Trigger 2b: Narrative alignment ──────────────────────────────────────────
+
+def check_narrative_alignment(conn) -> int:
+    """
+    Alert on narrative coordination campaigns created by narrative_clustering.py.
+    These use cluster_key LIKE 'narrative_%' to distinguish them from simhash
+    clusters.  They represent thematic coordination (same keywords across
+    accounts/platforms) rather than near-duplicate text (bot amplification).
+
+    Severity:
+    - HIGH  if cross-platform (narrative_multi) OR confidence ≥ 0.7
+    - MEDIUM otherwise
+    """
+    new_alerts = 0
+
+    for row in db.stream_rows(conn, """
+        SELECT DISTINCT c.id, c.keyword, c.platform, c.account_count,
+               c.post_count, c.confidence_score, c.first_seen, c.last_seen,
+               cl.cluster_key
+        FROM campaigns c
+        JOIN clusters cl ON cl.campaign_id = c.id
+        WHERE c.active = 1
+          AND cl.cluster_key LIKE 'narrative_%'
+          AND NOT EXISTS (
+              SELECT 1 FROM alerts a
+              WHERE a.alert_type = 'narrative_alignment'
+                AND a.keyword    = c.keyword
+                AND a.platform   = c.platform
+          )
+        GROUP BY c.id
+        ORDER BY c.confidence_score DESC
+        LIMIT 50
+    """):
+        is_cross = row['platform'] in ('narrative_multi',)
+        severity = 'high' if (is_cross or row['confidence_score'] >= 0.7) else 'medium'
+
+        # Resolve contributing platforms from actual post records
+        plat_rows = conn.execute("""
+            SELECT DISTINCT p.platform
+            FROM clusters cl2
+            JOIN posts p ON p.id = cl2.post_id
+            WHERE cl2.campaign_id = ?
+        """, (row['id'],)).fetchall()
+        platforms_list = sorted({r[0] for r in plat_rows}) if plat_rows else [row['platform']]
+
+        # Human-readable keyword list from cluster_key
+        raw_key = row['cluster_key'] or ''
+        kw_display = (raw_key
+                      .replace('narrative_xp_', '')
+                      .replace('narrative_', '')
+                      .replace(',', ', '))
+
+        window_str = _time_window_str(row['first_seen'], row['last_seen'])
+
+        if is_cross:
+            coord_note = (
+                f"Cross-platform narrative: same themes on {', '.join(platforms_list)}\n"
+                f"      Consistent with coordinated influence operation pipeline."
+            )
+        else:
+            coord_note = (
+                f"Within-platform: {row['account_count']} accounts pushing same narrative.\n"
+                f"      Consistent with coordinated channel messaging."
+            )
+
+        description = (
+            f"Narrative alignment detected\n"
+            f"Keywords:    {kw_display}\n"
+            f"Platform(s): {', '.join(platforms_list)}\n"
+            f"Accounts:    {row['account_count']}\n"
+            f"Posts:       {row['post_count']}\n"
+            f"Window:      {window_str}\n"
+            f"Confidence:  {_confidence_label(row['confidence_score'])}\n"
+            f"{coord_note}"
+        )
+
+        account_ids = []
+        for acct_row in db.stream_rows(conn, """
+            SELECT DISTINCT p.account_id
+            FROM clusters cl2
+            JOIN posts p ON p.id = cl2.post_id
+            WHERE cl2.campaign_id = ?
+            LIMIT 50
+        """, (row['id'],)):
+            account_ids.append(acct_row[0])
+
+        db.create_alert(
+            conn,
+            alert_type='narrative_alignment',
+            severity=severity,
+            description=description,
+            platform=row['platform'],
+            account_ids=account_ids,
+            keyword=row['keyword'],
+        )
+        new_alerts += 1
+        logger.info("Alert: narrative_alignment [%s] kw='%s' platforms=%s conf=%.2f",
+                    severity, row['keyword'], platforms_list, row['confidence_score'])
+
+    return new_alerts
+
+
+# ── Trigger 2c: Scheduled posting pattern ────────────────────────────────────
 
 def check_scheduled_accounts(conn) -> int:
     """

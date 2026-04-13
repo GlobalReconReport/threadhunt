@@ -234,6 +234,18 @@ def cmd_analyze(args):
         progress.update(task2, completed=100,
                         description=f"[green]Campaigns — {new_campaigns} new detected")
 
+        # Step 2b: Narrative clustering (semantic coordination — separate from simhash)
+        task2b = progress.add_task("[cyan]Narrative clustering...", total=100)
+        from analysis.narrative_clustering import run as run_narrative_clustering
+
+        def _narr_progress(current, total):
+            if total > 0:
+                progress.update(task2b, completed=int(current / total * 100))
+
+        narrative_clusters = run_narrative_clustering(progress_cb=_narr_progress)
+        progress.update(task2b, completed=100,
+                        description=f"[green]Narrative alignment — {narrative_clusters} clusters found")
+
         # Step 3: Language tagging
         task3 = progress.add_task("[cyan]Language tagging...", total=None)
         from analysis.similarity import tag_posts_language
@@ -272,11 +284,12 @@ def cmd_analyze(args):
                         total=1, completed=1)
 
     console.print(f"\n[green]Analysis complete.[/green]")
-    console.print(f"  Flagged bots:      [red]{flagged}[/red]")
-    console.print(f"  New campaigns:     [yellow]{new_campaigns}[/yellow]")
-    console.print(f"  Temporal profiled: [cyan]{temporal_count}[/cyan]")
-    console.print(f"  Identity links:    [cyan]{id_links}[/cyan]  Time-correlated: [cyan]{id_corr}[/cyan]")
-    console.print(f"  New alerts:        [red]{new_alerts}[/red]")
+    console.print(f"  Flagged bots:        [red]{flagged}[/red]")
+    console.print(f"  SimHash campaigns:   [yellow]{new_campaigns}[/yellow]")
+    console.print(f"  Narrative clusters:  [yellow]{narrative_clusters}[/yellow]")
+    console.print(f"  Temporal profiled:   [cyan]{temporal_count}[/cyan]")
+    console.print(f"  Identity links:      [cyan]{id_links}[/cyan]  Time-correlated: [cyan]{id_corr}[/cyan]")
+    console.print(f"  New alerts:          [red]{new_alerts}[/red]")
 
 
 # ── alert ─────────────────────────────────────────────────────────────────────
