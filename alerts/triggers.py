@@ -26,7 +26,9 @@ def check_all(conn) -> int:
     """
     total = 0
     total += check_new_campaigns(conn)
+    total += check_cross_platform_amplification(conn)
     total += check_high_bot_scores(conn)
+    total += check_scheduled_accounts(conn)
     total += check_narrative_reemergence(conn)
     total += check_keyword_spikes(conn)
     return total
@@ -98,7 +100,147 @@ def check_new_campaigns(conn) -> int:
     return new_alerts
 
 
-# ── Trigger 2: Bot score threshold ───────────────────────────────────────────
+# ── Trigger 2: Cross-platform narrative amplification ────────────────────────
+
+def check_cross_platform_amplification(conn) -> int:
+    """
+    Alert on campaigns with platform='multi' that have no alert yet.
+    These are created by campaign_engine._detect_cross_platform() when the
+    same narrative (simhash cluster) appears on 2+ platforms within 24h.
+
+    Severity is always HIGH — cross-platform coordination is the primary
+    mission signal for foreign influence operation detection.
+    """
+    new_alerts = 0
+
+    for row in db.stream_rows(conn, """
+        SELECT c.id, c.keyword, c.first_seen, c.last_seen,
+               c.confidence_score, c.post_count
+        FROM campaigns c
+        WHERE c.platform = 'multi'
+          AND c.active = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM alerts a
+              WHERE a.alert_type = 'cross_platform_amplification'
+                AND a.keyword = c.keyword
+          )
+        ORDER BY c.confidence_score DESC
+        LIMIT 50
+    """):
+        # Resolve which platforms contributed
+        platform_rows = conn.execute("""
+            SELECT DISTINCT ca.platform
+            FROM clusters cl
+            JOIN campaigns ca ON ca.id = cl.campaign_id
+            WHERE ca.id IN (
+                SELECT campaign_id FROM clusters
+                WHERE post_id IN (
+                    SELECT post_id FROM clusters WHERE campaign_id=?
+                )
+            )
+              AND ca.platform != 'multi'
+        """, (row['id'],)).fetchall()
+        platforms = [r[0] for r in platform_rows] if platform_rows else ['unknown']
+
+        description = (
+            f"Cross-platform narrative amplification\n"
+            f"Platforms:  {' → '.join(platforms)}\n"
+            f"Keyword:    {row['keyword'] or 'N/A'}\n"
+            f"First seen: {row['first_seen']}\n"
+            f"Confidence: {_confidence_label(row['confidence_score'])}\n"
+            f"NOTE: Same narrative cluster detected across multiple platforms.\n"
+            f"      Consistent with foreign influence operation pipeline."
+        )
+
+        db.create_alert(
+            conn,
+            alert_type='cross_platform_amplification',
+            severity='high',
+            description=description,
+            platform='multi',
+            keyword=row['keyword'],
+        )
+        new_alerts += 1
+        logger.info("Alert: cross_platform_amplification kw='%s' platforms=%s",
+                    row['keyword'], platforms)
+
+    return new_alerts
+
+
+# ── Trigger 2b: Scheduled posting pattern ────────────────────────────────────
+
+def check_scheduled_accounts(conn) -> int:
+    """
+    Alert on accounts whose temporal profile shows scheduled/automated posting.
+    Criteria: posting_entropy < 2.0 with >= 20 posts = bot/scheduler indicator.
+    Additional signal: UTC+3 timezone (Moscow/Minsk) on Telegram/Nitter accounts.
+    """
+    new_alerts = 0
+    threshold_entropy = 2.0
+    min_posts = 20
+
+    for row in db.stream_rows(conn, """
+        SELECT a.id, a.username, a.platform, a.posting_entropy,
+               a.timezone_offset, COUNT(p.id) as post_count
+        FROM accounts a
+        JOIN posts p ON p.account_id = a.id
+        WHERE a.posting_entropy IS NOT NULL
+          AND a.posting_entropy < ?
+          AND a.platform IN ('telegram', 'nitter', 'twitter', 'vk')
+        GROUP BY a.id
+        HAVING post_count >= ?
+        ORDER BY a.posting_entropy ASC
+        LIMIT 50
+    """, (threshold_entropy, min_posts)):
+        # Avoid re-alerting
+        dup = conn.execute("""
+            SELECT id FROM alerts
+            WHERE alert_type='scheduled_posting'
+              AND account_ids LIKE '%' || ? || '%'
+              AND created_at >= ?
+        """, (str(row['id']),
+              (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat())
+        ).fetchone()
+        if dup:
+            continue
+
+        tz_note = ''
+        if row['timezone_offset'] is not None:
+            tz = row['timezone_offset']
+            tz_label = {3: 'Moscow/Minsk', 2: 'Eastern Europe',
+                        8: 'Beijing/Shanghai', 0: 'UTC/London'}.get(tz, f'UTC{tz:+d}')
+            tz_note = f"\nTimezone:  UTC{tz:+d} ({tz_label})"
+            if tz in (3, 2):
+                tz_note += '  ← attribution signal'
+
+        description = (
+            f"Automated/scheduled posting pattern detected\n"
+            f"Account:   @{row['username']} on {row['platform']}\n"
+            f"Entropy:   {row['posting_entropy']:.2f} (max 4.58, < 2.0 = scheduled)\n"
+            f"Posts:     {row['post_count']}"
+            f"{tz_note}"
+        )
+
+        severity = 'high' if (row['timezone_offset'] in (3, 2) and
+                              row['platform'] in ('telegram', 'nitter')) else 'medium'
+
+        db.create_alert(
+            conn,
+            alert_type='scheduled_posting',
+            severity=severity,
+            description=description,
+            platform=row['platform'],
+            account_ids=[row['id']],
+        )
+        new_alerts += 1
+        logger.info("Alert: scheduled_posting @%s (%s) entropy=%.2f tz=%s",
+                    row['username'], row['platform'],
+                    row['posting_entropy'], row['timezone_offset'])
+
+    return new_alerts
+
+
+# ── Trigger 4: Bot score threshold ───────────────────────────────────────────
 
 def check_high_bot_scores(conn) -> int:
     """
@@ -141,7 +283,7 @@ def check_high_bot_scores(conn) -> int:
     return new_alerts
 
 
-# ── Trigger 3: Narrative re-emergence ────────────────────────────────────────
+# ── Trigger 5: Narrative re-emergence ────────────────────────────────────────
 
 def check_narrative_reemergence(conn) -> int:
     """
@@ -227,7 +369,7 @@ def check_narrative_reemergence(conn) -> int:
     return new_alerts
 
 
-# ── Trigger 4: Keyword spike ──────────────────────────────────────────────────
+# ── Trigger 6: Keyword spike ──────────────────────────────────────────────────
 
 def check_keyword_spikes(conn) -> int:
     """

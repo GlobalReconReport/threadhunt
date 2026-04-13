@@ -53,6 +53,30 @@ DEFAULT_CONFIG = {
 
     # 4chan boards to monitor by default
     'fourchan_boards': ['pol', 'k', 'int'],
+
+    # Telegram: curated list of known Russian state-adjacent and disinfo channels.
+    # Used when `collect --platform telegram` is run without --target.
+    # rybar/grey_zone/readovka = pro-Kremlin milbloggers with high amplification reach
+    # war_monitor/kremlin_inform = aggregators for Russian military narrative
+    # rt_general/sputnik_int = state media English-language outlets
+    'telegram_channels': [
+        'rybar',
+        'grey_zone',
+        'readovkanews',
+        'war_monitor',
+        'kremlin_inform',
+        'rt_general',
+        'sputnik_int',
+    ],
+
+    # VK: known Russian state media groups.
+    # Used when `collect --platform vk` is run without --target.
+    'vk_groups': [
+        'rt_russian',
+        'ria_novosti',
+        'tass_agency',
+        'sputnik_russia',
+    ],
 }
 
 _config: dict | None = None

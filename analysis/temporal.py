@@ -162,6 +162,58 @@ def account_temporal_profile(account_id: int, conn) -> dict:
     }
 
 
+# ── Pipeline entry point ─────────────────────────────────────────────────────
+
+def run_temporal_analysis(conn) -> int:
+    """
+    Compute temporal profiles for all accounts with >= 10 posts.
+    Updates accounts.timezone_offset and accounts.posting_entropy.
+    Returns count of accounts analyzed.
+
+    Called by the analyze pipeline. Logs attribution signals:
+    - Low entropy (< 2.0) with >= 20 posts = likely scheduled/automated
+    - Timezone offset +3 = Moscow time attribution signal
+    """
+    rows = []
+    for row in db.stream_rows(conn, """
+        SELECT a.id, a.username, a.platform, COUNT(p.id) as post_count
+        FROM accounts a
+        JOIN posts p ON p.account_id = a.id
+        GROUP BY a.id
+        HAVING COUNT(p.id) >= 10
+        LIMIT 500
+    """):
+        rows.append(dict(row))
+
+    analyzed = 0
+    for acct in rows:
+        profile = account_temporal_profile(acct['id'], conn)
+        conn.execute("""
+            UPDATE accounts
+            SET timezone_offset=?, posting_entropy=?
+            WHERE id=?
+        """, (profile['likely_tz_offset'], profile['entropy'], acct['id']))
+        analyzed += 1
+
+        if profile['is_scheduled']:
+            logger.info(
+                "Temporal: @%s (%s) scheduled posting — entropy=%.2f active_hours=%s",
+                acct['username'], acct['platform'],
+                profile['entropy'], profile['active_hours_utc']
+            )
+        if profile['likely_tz_offset'] is not None:
+            tz = profile['likely_tz_offset']
+            # Flag attribution-relevant timezone offsets
+            # +3=Moscow/Minsk, +2=Eastern Europe, +8=Beijing
+            if tz in (3, 2, 8):
+                logger.info(
+                    "Temporal: @%s (%s) likely timezone UTC%+d (attribution signal)",
+                    acct['username'], acct['platform'], tz
+                )
+
+    return analyzed
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _hour_from_ts(ts: str) -> int | None:

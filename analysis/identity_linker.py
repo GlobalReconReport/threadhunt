@@ -186,19 +186,43 @@ def find_time_correlated_accounts(conn, window_seconds: int = 300,
 def run_identity_linking(conn) -> dict:
     """
     Run all three identity signals. Returns combined report dict.
-    """
-    username_links   = []
-    shared_pics      = find_shared_profile_pics(conn)
-    time_correlated  = find_time_correlated_accounts(conn)
 
-    # Username linking: sample flagged accounts only (performance)
-    for row in db.stream_rows(conn,
-        "SELECT username, platform FROM accounts WHERE flagged=1 LIMIT 200"
-    ):
-        matches = find_similar_usernames(row[0], row[1], conn)
+    Candidate accounts for username linking:
+    1. All Telegram/Nitter/Twitter/VK accounts — real usernames with cross-platform signal
+    2. Accounts that appear in any active campaign cluster
+    The flagged=1 prerequisite is removed — it was a circular dependency that
+    prevented linking from ever running.
+    """
+    username_links  = []
+    shared_pics     = find_shared_profile_pics(conn)
+    time_correlated = find_time_correlated_accounts(conn)
+
+    # Collect candidates: real-account platforms + campaign members
+    candidates = {}  # (username, platform) keyed for dedup
+
+    for row in db.stream_rows(conn, """
+        SELECT username, platform FROM accounts
+        WHERE platform IN ('telegram', 'nitter', 'twitter', 'vk')
+        LIMIT 500
+    """):
+        candidates[(row[0], row[1])] = True
+
+    for row in db.stream_rows(conn, """
+        SELECT DISTINCT a.username, a.platform
+        FROM accounts a
+        JOIN posts p ON p.account_id = a.id
+        JOIN clusters cl ON cl.post_id = p.id
+        JOIN campaigns c ON c.id = cl.campaign_id
+        WHERE c.active = 1
+        LIMIT 200
+    """):
+        candidates[(row[0], row[1])] = True
+
+    for (username, platform) in candidates:
+        matches = find_similar_usernames(username, platform, conn)
         if matches:
             username_links.append({
-                'source': {'username': row[0], 'platform': row[1]},
+                'source':  {'username': username, 'platform': platform},
                 'matches': matches,
             })
 

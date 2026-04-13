@@ -75,7 +75,8 @@ def thread_matches_keywords(thread: dict, keywords: list) -> bool:
 
 # ── Post ingestion ────────────────────────────────────────────────────────────
 
-def _ingest_post(conn, account_id: int, board: str, post: dict) -> bool:
+def _ingest_post(conn, account_id: int, board: str, post: dict,
+                 thread_no: int = None) -> bool:
     """Parse a 4chan post dict and insert into DB. Returns True if new."""
     raw_com = post.get('com', '')
     content = strip_html(raw_com).strip()
@@ -92,7 +93,8 @@ def _ingest_post(conn, account_id: int, board: str, post: dict) -> bool:
     else:
         timestamp = datetime.now(timezone.utc).isoformat()
 
-    return db.insert_post(conn, account_id, f'4chan/{board}', post_id, content, timestamp)
+    return db.insert_post(conn, account_id, f'4chan/{board}', post_id, content,
+                          timestamp, thread_no=thread_no)
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -141,9 +143,9 @@ def collect(session, target: str = None, keyword: str = None, verbose_cb=None) -
             if verbose_cb:
                 verbose_cb(f"/{board}/: collecting all {len(catalog)} threads (no filter)")
 
-        # Ensure a synthetic account for this board
+        # Board-level fallback account (used on boards without poster IDs)
         with db.get_conn() as conn:
-            account_id = db.upsert_account(conn, f'4chan_{board}', f'4chan/{board}')
+            board_account_id = db.upsert_account(conn, f'4chan_{board}', f'4chan/{board}')
 
         threads_fetched = 0
         threads_404 = 0
@@ -169,6 +171,12 @@ def collect(session, target: str = None, keyword: str = None, verbose_cb=None) -
 
             threads_fetched += 1
             with db.get_conn() as conn:
+                # Cache poster accounts within this thread fetch to avoid
+                # repeated upserts for the same poster_id.
+                # Note: 4chan poster IDs are thread-scoped (IP+board+thread salt),
+                # so the same person gets a different ID in each thread.
+                poster_cache: dict = {}
+
                 for post in posts:
                     if new_total >= cap:
                         break
@@ -177,8 +185,22 @@ def collect(session, target: str = None, keyword: str = None, verbose_cb=None) -
                     if not content:
                         posts_imageonly += 1
                         continue
+
+                    # Per-poster account when board has IDs (pol, int, news…)
+                    poster_id = post.get('id')
+                    if poster_id:
+                        poster_key = f'4chan_{board}_{poster_id}'
+                        if poster_key not in poster_cache:
+                            poster_cache[poster_key] = db.upsert_account(
+                                conn, poster_key, f'4chan/{board}'
+                            )
+                        post_account_id = poster_cache[poster_key] or board_account_id
+                    else:
+                        post_account_id = board_account_id
+
                     posts_text += 1
-                    if _ingest_post(conn, account_id, board, post):
+                    if _ingest_post(conn, post_account_id, board, post,
+                                    thread_no=thread_no):
                         new_total += 1
 
             time.sleep(1)  # 4chan API rate limit guidance: 1 req/sec

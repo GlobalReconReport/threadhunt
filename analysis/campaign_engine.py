@@ -20,9 +20,11 @@ def run(progress_cb=None) -> int:
     Full campaign detection pass. Returns number of new campaigns detected.
     Called by `threadhunt analyze`.
     """
-    time_window = config.get('campaign_time_window_minutes', 30)
-    min_accounts = config.get('campaign_min_accounts', 3)
-    max_dist = config.get('campaign_simhash_distance', 5)
+    time_window         = config.get('campaign_time_window_minutes', 30)
+    # 4chan uses a longer window — cross-thread coordination can span hours
+    fourchan_time_window = config.get('fourchan_campaign_time_window_minutes', 1440)
+    min_accounts        = config.get('campaign_min_accounts', 3)
+    max_dist            = config.get('campaign_simhash_distance', 5)
 
     new_campaigns = 0
 
@@ -36,9 +38,19 @@ def run(progress_cb=None) -> int:
     for i, platform in enumerate(platforms):
         if progress_cb:
             progress_cb(i + 1, len(platforms))
-        new_campaigns += _detect_platform(
-            platform, time_window, min_accounts, max_dist
-        )
+        if platform.startswith('4chan/'):
+            new_campaigns += _detect_fourchan(
+                platform, fourchan_time_window, min_accounts, max_dist
+            )
+        else:
+            new_campaigns += _detect_platform(
+                platform, time_window, min_accounts, max_dist
+            )
+
+    # Second pass: cross-platform cluster matching
+    with db.get_conn() as conn:
+        cross = _detect_cross_platform(conn, max_dist + 5)
+    new_campaigns += cross
 
     logger.info("Campaign engine: %d new campaigns detected", new_campaigns)
     return new_campaigns
@@ -106,6 +118,209 @@ def _detect_platform(platform: str, time_window: int, min_accounts: int,
         new_campaigns += 1
 
     return new_campaigns
+
+
+def _detect_fourchan(platform: str, time_window: int, min_threads: int,
+                     max_dist: int) -> int:
+    """
+    4chan-specific campaign detection.
+
+    On anonymous boards there are no real accounts — instead, coordination
+    shows as near-identical content copy-pasted (or lightly rephrased) across
+    multiple distinct threads. We use thread_no as the "account" axis:
+    a cluster spanning 3+ different threads is a coordinated campaign.
+
+    Requires thread_no to be populated on post rows (fourchan collector
+    backfills this on re-collection for any NULL rows).
+    """
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=time_window)
+    ).isoformat()
+
+    posts = []
+    with db.get_conn() as conn:
+        for row in db.stream_rows(conn, """
+            SELECT p.id, p.thread_no, p.simhash, p.timestamp, p.content
+            FROM posts p
+            WHERE p.platform = ?
+              AND p.timestamp >= ?
+              AND p.simhash != 0
+              AND p.thread_no IS NOT NULL
+            ORDER BY p.timestamp DESC
+            LIMIT 10000
+        """, (platform, cutoff)):
+            posts.append(dict(row))
+
+    if len(posts) < min_threads:
+        return 0
+
+    # Greedy single-pass clustering — same algorithm as standard detection
+    cluster_reps  = []
+    cluster_posts = []
+
+    for post in posts:
+        sh = post['simhash']
+        matched = None
+        for idx, rep in enumerate(cluster_reps):
+            if hamming_distance(sh, rep) <= max_dist:
+                matched = idx
+                break
+        if matched is None:
+            cluster_reps.append(sh)
+            cluster_posts.append([post])
+        else:
+            cluster_posts[matched].append(post)
+
+    new_campaigns = 0
+
+    for idx, cluster in enumerate(cluster_posts):
+        # "Account" axis for 4chan = distinct thread_nos
+        unique_threads = {p['thread_no'] for p in cluster if p['thread_no']}
+        if len(unique_threads) < min_threads:
+            continue
+
+        rep_sh = cluster_reps[idx]
+        if _cluster_already_tracked(rep_sh, platform):
+            _update_campaign(rep_sh, platform, cluster, unique_threads)
+            continue
+
+        confidence = _confidence_score(cluster, unique_threads, max_dist)
+        _save_campaign(rep_sh, platform, cluster, unique_threads, confidence)
+        new_campaigns += 1
+
+    return new_campaigns
+
+
+def _detect_cross_platform(conn, max_dist: int) -> int:
+    """
+    Second-pass detection: find campaigns on different platforms whose simhash
+    centroids are within max_dist of each other and whose first_seen timestamps
+    are within 24 hours.
+
+    Real influence operations push narratives across platforms in sequence:
+    Telegram → Twitter/Nitter → 4chan radicalization pipeline.
+
+    Matching campaigns are linked via a new 'cross_platform_campaign' entry
+    in the campaigns table (platform = 'multi') so they surface in reports.
+    Returns count of new cross-platform campaign records created.
+    """
+    # Load all active campaigns with their representative simhash
+    campaign_rows = []
+    for row in db.stream_rows(conn, """
+        SELECT c.id, c.platform, c.first_seen, c.keyword, c.confidence_score,
+               cl.cluster_key
+        FROM campaigns c
+        JOIN clusters cl ON cl.campaign_id = c.id
+        WHERE c.active = 1
+        GROUP BY c.id
+        ORDER BY c.first_seen DESC
+        LIMIT 200
+    """):
+        try:
+            key_int = int(row['cluster_key'])
+        except (TypeError, ValueError):
+            continue
+        campaign_rows.append({
+            'id':           row['id'],
+            'platform':     row['platform'],
+            'first_seen':   row['first_seen'],
+            'keyword':      row['keyword'],
+            'confidence':   row['confidence_score'],
+            'key':          key_int,
+        })
+
+    if len(campaign_rows) < 2:
+        return 0
+
+    new_cross = 0
+    reported = set()
+
+    for i, ca in enumerate(campaign_rows):
+        for cb in campaign_rows[i + 1:]:
+            if ca['platform'] == cb['platform']:
+                continue
+
+            dist = hamming_distance(ca['key'], cb['key'])
+            if dist > max_dist:
+                continue
+
+            # Time constraint: both first_seen within 24h of each other
+            ts_a = _parse_ts_local(ca['first_seen'])
+            ts_b = _parse_ts_local(cb['first_seen'])
+            if ts_a and ts_b:
+                gap_hours = abs((ts_a - ts_b).total_seconds()) / 3600
+                if gap_hours > 24:
+                    continue
+
+            # Canonical dedup key — sort campaign ids
+            pair_key = (min(ca['id'], cb['id']), max(ca['id'], cb['id']))
+            if pair_key in reported:
+                continue
+            reported.add(pair_key)
+
+            # Check if this cross-platform link already recorded
+            already = conn.execute("""
+                SELECT id FROM campaigns
+                WHERE platform='multi'
+                  AND keyword=?
+                  AND first_seen >= ?
+            """, (
+                ca['keyword'] or cb['keyword'] or '',
+                (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+            )).fetchone()
+            if already:
+                continue
+
+            # Determine origin (whichever platform saw it first)
+            if ts_a and ts_b:
+                origin, amplifier = (ca, cb) if ts_a <= ts_b else (cb, ca)
+                delta_mins = int(abs((ts_a - ts_b).total_seconds()) / 60)
+            else:
+                origin, amplifier = ca, cb
+                delta_mins = 0
+
+            keyword  = origin['keyword'] or amplifier['keyword'] or ''
+            now      = datetime.now(timezone.utc).isoformat()
+            avg_conf = (origin['confidence'] + amplifier['confidence']) / 2
+
+            cursor = conn.execute("""
+                INSERT INTO campaigns
+                    (keyword, platform, first_seen, last_seen,
+                     post_count, account_count, confidence_score, active)
+                VALUES (?, 'multi', ?, ?, 0, 0, ?, 1)
+            """, (keyword, origin['first_seen'] or now, now,
+                  round(min(1.0, avg_conf * 1.2), 3)))  # slight confidence boost
+            campaign_id = cursor.lastrowid
+
+            # Link source campaigns via clusters (post_id reused as campaign_id ref)
+            for src in (ca, cb):
+                conn.execute("""
+                    INSERT OR IGNORE INTO clusters (campaign_id, post_id, cluster_key)
+                    SELECT ?, post_id, cluster_key FROM clusters
+                    WHERE campaign_id=? LIMIT 10
+                """, (campaign_id, src['id']))
+
+            logger.info(
+                "Cross-platform campaign #%d: %s→%s kw='%s' dist=%d delta=%dm",
+                campaign_id, origin['platform'], amplifier['platform'],
+                keyword, dist, delta_mins
+            )
+            new_cross += 1
+
+    return new_cross
+
+
+def _parse_ts_local(ts: str):
+    """Parse ISO timestamp string to datetime (used internally)."""
+    if not ts:
+        return None
+    ts = ts.rstrip('Z').split('+')[0]
+    for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M'):
+        try:
+            return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
 
 
 def _cluster_already_tracked(rep_sh: int, platform: str) -> bool:

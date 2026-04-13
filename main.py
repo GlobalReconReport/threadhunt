@@ -131,20 +131,36 @@ def cmd_collect(args):
         console.print(f"[dim]Supported: {', '.join(sorted(set(COLLECTORS.keys())))}[/dim]")
         sys.exit(1)
 
-    module_path = COLLECTORS[platform]
     import importlib
-    mod = importlib.import_module(module_path)
+    mod = importlib.import_module(COLLECTORS[platform])
+
+    # Resolve target list — platforms that support bulk collection without --target
+    if target:
+        targets = [target]
+    elif platform in ('telegram',):
+        targets = cfg.get('telegram_channels', [])
+        if not targets:
+            console.print("[yellow]No telegram_channels configured. Use --target or set telegram_channels in config.[/yellow]")
+            return
+        console.print(f"[dim]Collecting from {len(targets)} configured Telegram channels[/dim]")
+    elif platform in ('vk',):
+        targets = cfg.get('vk_groups', [])
+        if not targets:
+            console.print("[yellow]No vk_groups configured. Use --target or set vk_groups in config.[/yellow]")
+            return
+        console.print(f"[dim]Collecting from {len(targets)} configured VK groups[/dim]")
+    elif platform in ('4chan', 'fourchan'):
+        # fourchan collector handles None target internally (uses fourchan_boards)
+        targets = [None]
+    else:
+        console.print(f"[red]--target required for platform: {platform}[/red]")
+        return
 
     # Session tracking
     with db.get_conn() as conn:
         session_id = db.start_session(conn, platform=platform)
 
-    spinner_msg = f"Collecting from [cyan]{platform}[/cyan] → {escape(target)}"
     new_count = 0
-    status_text = [spinner_msg]
-
-    def update_status(msg: str):
-        status_text[0] = msg
 
     with Progress(
         SpinnerColumn(),
@@ -152,32 +168,33 @@ def cmd_collect(args):
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task(spinner_msg, total=None)
+        task = progress.add_task(f"[cyan]{platform}[/cyan]", total=None)
 
         def verbose_cb(msg: str):
             if verbose:
                 progress.update(task, description=f"[cyan]{platform}[/cyan] {escape(str(msg))}")
 
-        try:
-            new_count = mod.collect(
-                session, target,
-                keyword=keyword,
-                verbose_cb=verbose_cb,
-            )
-        except Exception as e:
-            logger.error("Collector error [%s]: %s", platform, e)
-            console.print(f"[red]Collector error: {e}[/red]")
+        for t in targets:
+            label = t or platform
+            progress.update(task, description=f"[cyan]{platform}[/cyan] → {escape(str(label))}")
+            try:
+                n = mod.collect(session, t, keyword=keyword, verbose_cb=verbose_cb)
+                new_count += n
+                logger.info("Collect: %d posts from %s/%s", n, platform, label)
+            except Exception as e:
+                logger.error("Collector error [%s/%s]: %s", platform, label, e)
+                console.print(f"[red]Collector error [{label}]: {e}[/red]")
 
     # Update session
     with db.get_conn() as conn:
         db.end_session(conn, session_id,
                        posts_collected=new_count, alerts_triggered=0)
 
+    target_label = target or f"({len(targets)} targets)"
     console.print(
         f"[green]✓[/green] Collected [bold]{new_count}[/bold] new posts "
-        f"from [cyan]{platform}[/cyan] / {escape(target)}"
+        f"from [cyan]{platform}[/cyan] / {escape(str(target_label))}"
     )
-    logger.info("Collect: %d posts from %s/%s", new_count, platform, target)
 
 
 # ── analyze ───────────────────────────────────────────────────────────────────
@@ -225,7 +242,27 @@ def cmd_analyze(args):
         progress.update(task3, description=f"[green]Language — {lang_tagged} posts tagged",
                         total=1, completed=1)
 
-        # Step 4: Alert triggers
+        # Step 4: Temporal analysis — posting entropy + timezone inference
+        task_temporal = progress.add_task("[cyan]Temporal profiling...", total=None)
+        from analysis.temporal import run_temporal_analysis
+        with db.get_conn() as conn:
+            temporal_count = run_temporal_analysis(conn)
+        progress.update(task_temporal,
+                        description=f"[green]Temporal — {temporal_count} accounts profiled",
+                        total=1, completed=1)
+
+        # Step 5: Identity linking — cross-platform username/pic/timing signals
+        task_identity = progress.add_task("[cyan]Identity linking...", total=None)
+        from analysis.identity_linker import run_identity_linking
+        with db.get_conn() as conn:
+            id_report = run_identity_linking(conn)
+        id_links = len(id_report.get('username_links', []))
+        id_corr  = len(id_report.get('time_correlated', []))
+        progress.update(task_identity,
+                        description=f"[green]Identity — {id_links} username links, {id_corr} time-correlated",
+                        total=1, completed=1)
+
+        # Step 6: Alert triggers
         task4 = progress.add_task("[cyan]Checking alert triggers...", total=None)
         from alerts.triggers import check_all
         with db.get_conn() as conn:
@@ -235,9 +272,11 @@ def cmd_analyze(args):
                         total=1, completed=1)
 
     console.print(f"\n[green]Analysis complete.[/green]")
-    console.print(f"  Flagged bots:    [red]{flagged}[/red]")
-    console.print(f"  New campaigns:   [yellow]{new_campaigns}[/yellow]")
-    console.print(f"  New alerts:      [red]{new_alerts}[/red]")
+    console.print(f"  Flagged bots:      [red]{flagged}[/red]")
+    console.print(f"  New campaigns:     [yellow]{new_campaigns}[/yellow]")
+    console.print(f"  Temporal profiled: [cyan]{temporal_count}[/cyan]")
+    console.print(f"  Identity links:    [cyan]{id_links}[/cyan]  Time-correlated: [cyan]{id_corr}[/cyan]")
+    console.print(f"  New alerts:        [red]{new_alerts}[/red]")
 
 
 # ── alert ─────────────────────────────────────────────────────────────────────

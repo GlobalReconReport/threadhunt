@@ -70,6 +70,8 @@ def init_db():
             bio              TEXT,
             bot_score        REAL    DEFAULT 0.0,
             flagged          INTEGER DEFAULT 0,
+            timezone_offset  INTEGER DEFAULT NULL,
+            posting_entropy  REAL    DEFAULT NULL,
             created_at       TEXT,
             updated_at       TEXT,
             UNIQUE(username, platform)
@@ -87,6 +89,7 @@ def init_db():
             timestamp    TEXT,
             lang         TEXT,
             collected_at TEXT,
+            thread_no    INTEGER DEFAULT NULL,
             UNIQUE(platform, post_id),
             FOREIGN KEY (account_id) REFERENCES accounts(id)
         );
@@ -170,6 +173,28 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_clusters_camp    ON clusters(campaign_id);
         CREATE INDEX IF NOT EXISTS idx_clusters_key     ON clusters(cluster_key);
         """)
+
+        # Migration: add temporal columns to accounts (existing DBs)
+        for col_def in [
+            "ALTER TABLE accounts ADD COLUMN timezone_offset INTEGER DEFAULT NULL",
+            "ALTER TABLE accounts ADD COLUMN posting_entropy REAL DEFAULT NULL",
+        ]:
+            try:
+                conn.execute(col_def)
+            except Exception:
+                pass  # column already exists
+
+        # Migration: add thread_no column to existing DBs that predate it
+        try:
+            conn.execute("ALTER TABLE posts ADD COLUMN thread_no INTEGER DEFAULT NULL")
+            logger.debug("DB migration: added thread_no column to posts")
+        except Exception:
+            pass  # column already exists — safe to ignore
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_thread_no ON posts(thread_no)")
+        except Exception:
+            pass  # index already exists
+
     logger.info("DB initialized: %s", _get_db_path())
 
 
@@ -224,7 +249,8 @@ def upsert_account(conn, username: str, platform: str, **kwargs) -> int | None:
 
 
 def insert_post(conn, account_id: int, platform: str, post_id: str,
-                content: str, timestamp: str, lang: str = None) -> bool:
+                content: str, timestamp: str, lang: str = None,
+                thread_no: int = None) -> bool:
     """
     Insert post if not already present (platform, post_id unique).
     Returns True if the row was new, False if it was a duplicate.
@@ -238,11 +264,21 @@ def insert_post(conn, account_id: int, platform: str, post_id: str,
     conn.execute("""
         INSERT OR IGNORE INTO posts
             (account_id, platform, post_id, content, content_hash,
-             simhash, timestamp, lang, collected_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (account_id, platform, post_id, content, chash, sh, timestamp, lang, now))
+             simhash, timestamp, lang, collected_at, thread_no)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (account_id, platform, post_id, content, chash, sh, timestamp, lang, now,
+          thread_no))
 
     changed = conn.execute("SELECT changes()").fetchone()[0]
+
+    # Backfill thread_no on existing rows that predate this column (INSERT OR IGNORE
+    # skips the whole row if it already exists, so patch it separately).
+    if not changed and thread_no is not None:
+        conn.execute("""
+            UPDATE posts SET thread_no = ?
+            WHERE platform = ? AND post_id = ? AND thread_no IS NULL
+        """, (thread_no, platform, post_id))
+
     return changed > 0
 
 
