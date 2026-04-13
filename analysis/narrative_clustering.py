@@ -71,6 +71,10 @@ _STOPWORDS = frozenset({
     'episode', 'series', 'video', 'youtube', 'watch', 'channel',
     'subscribe', 'playlist', 'stream', 'podcast', 'interview', 'clip',
     'part', 'show', 'full', 'live', 'weekly', 'daily', 'official',
+    # Channel self-promotion / merch (The Duran, etc.)
+    'shop', 'gear', 'style', 'merch', 'follow', 'support', 'patron',
+    'patreon', 'membership', 'store', 'donate', 'link', 'links',
+    'duran', 'theduran', 'theduranshop', 'reversegear', 'athleisure',
     # Russian (Cyrillic — matched when posts contain Russian text)
     # Grammar / function words
     'что', 'это', 'для', 'как', 'все', 'они', 'или', 'его', 'был', 'при',
@@ -98,22 +102,126 @@ _STOPWORDS = frozenset({
 })
 
 
+# ── Cross-language normalization ──────────────────────────────────────────────
+# Maps Cyrillic geopolitical stems → English canonical form.
+# Applied inside extract_keywords() so ALL downstream consumers (clustering,
+# compare, alerts) work on a unified token space.
+#
+# Rules are ordered longest-prefix-first (built at module load) so that
+# more-specific stems match before shorter ones:
+#   e.g. 'российск' before 'росси' — both map to 'russia'
+#
+# Coverage: nation-states, leaders, and major organisations that appear
+# as coordinated narrative topics across Russian-language and English-language
+# platforms.  Deliberately narrow — only add terms that are genuine OSINT
+# signals, not generic vocabulary.
+_RU_NORM: dict[str, str] = {
+    # Iran / Iranian
+    'иранск':    'iran',
+    'иран':      'iran',
+    # Ukraine / Ukrainian
+    'украинск':  'ukraine',
+    'украин':    'ukraine',
+    # Russia / Russian
+    'российск':  'russia',
+    'российс':   'russia',
+    'россиян':   'russia',
+    'россия':    'russia',
+    'росси':     'russia',
+    # USA / America / American
+    'американск': 'american',
+    'американц':  'american',
+    'американн':  'american',
+    'американ':   'american',
+    'америк':     'america',
+    'сша':        'usa',
+    # Leaders
+    'путин':     'putin',
+    'трамп':     'trump',
+    'зеленск':   'zelensky',
+    'байден':    'biden',
+    'нетаньях':  'netanyahu',
+    'хамас':     'hamas',
+    # NATO / alliances
+    'нато':      'nato',
+    # Countries
+    'израильск': 'israel',
+    'израиль':   'israel',
+    'израил':    'israel',
+    'китайск':   'china',
+    'китай':     'china',
+    'сирийск':   'syria',
+    'сирия':     'syria',
+    'сири':      'syria',
+    'белорусск': 'belarus',
+    'белорусс':  'belarus',
+    'белорус':   'belarus',
+    'польск':    'poland',
+    'польш':     'poland',
+    'турецк':    'turkey',
+    'турци':     'turkey',
+    'европейск': 'europe',
+    'европ':     'europe',
+    # Key topics
+    'пропаганд': 'propaganda',
+    'перемири':  'ceasefire',
+    'переговор': 'negotiations',
+    'санкци':    'sanctions',
+    'ядерн':     'nuclear',
+    'наступлени': 'offensive',
+    'наступлен': 'offensive',
+    'оккупаци':  'occupation',
+    'мобилизаци': 'mobilization',
+    'мобилизац': 'mobilization',
+}
+
+# Pre-sort longest prefix first to ensure most-specific match wins
+_RU_NORM_SORTED: list[tuple[str, str]] = sorted(
+    _RU_NORM.items(), key=lambda x: len(x[0]), reverse=True
+)
+
+
+def _normalize_token(token: str) -> str:
+    """
+    Map a Cyrillic token to its English canonical form if it matches a known
+    geopolitical stem.  Tokens without Cyrillic characters are returned as-is.
+    """
+    # Fast path: purely ASCII — no normalization needed
+    if token.isascii():
+        return token
+    # Only normalize tokens that contain Cyrillic
+    if not re.search(r'[\u0400-\u04FF]', token):
+        return token
+    for prefix, english in _RU_NORM_SORTED:
+        if token.startswith(prefix):
+            return english
+    return token
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def extract_keywords(text: str, top_n: int = 20) -> list:
     """
     Extract significant keywords from text.
     Handles Latin (a-z) and Cyrillic (Russian) scripts.
-    Returns top_n most-frequent tokens after stopword filtering.
+    Cyrillic geopolitical terms are normalized to their English canonical form
+    so that cross-platform/cross-language comparisons share a unified token
+    space (e.g. Telegram "иран" and YouTube "iran" both yield "iran").
+    Returns top_n most-frequent tokens after stopword filtering + normalization.
     """
     if not text:
         return []
     # Matches both Latin and Cyrillic word characters, min 4 chars
     tokens = re.findall(r'[a-zA-Z\u0400-\u04FF]{4,}', text.lower())
-    filtered = [t for t in tokens if t not in _STOPWORDS]
-    if not filtered:
+    # Stopword filter first (avoids normalizing tokens we'd discard anyway)
+    raw = [t for t in tokens if t not in _STOPWORDS]
+    if not raw:
         return []
-    freq = Counter(filtered)
+    # Normalize Cyrillic geopolitical stems → English canonical form.
+    # Multiple Russian inflections of the same stem (иран/ирана/ираном) all
+    # collapse to 'iran', boosting that token's frequency correctly.
+    normalized = [_normalize_token(t) for t in raw]
+    freq = Counter(normalized)
     return [w for w, _ in freq.most_common(top_n)]
 
 

@@ -469,7 +469,7 @@ def cmd_compare(args):
     console.print()
 
     # ── Narrative clusters spanning both groups ───────────────────────────────
-    min_overlap = config.get('narrative_min_keyword_overlap', 3)
+    min_overlap = cfg.get('narrative_min_keyword_overlap', 3)
     all_posts   = source_posts + target_posts
     clusters    = _greedy_cluster(all_posts, min_overlap=min_overlap)
 

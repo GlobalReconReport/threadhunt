@@ -88,9 +88,11 @@ DEFAULT_CONFIG = {
     # Use the exact @handle (case-sensitive as YouTube has it).
     # Mix of Western-facing Russian state media and relevant disinfo vectors.
     'youtube_channels': [
-        'grayzone',      # The Grayzone — confirmed @grayzone handle
-        'RT',            # RT English — confirmed @RT handle
-        'DDGeopolitics', # DD Geopolitics — confirmed @DDGeopolitics handle
+        'grayzone',        # The Grayzone — verified @grayzone handle (TheGrayzoneNews 404s)
+        'RT',              # RT English — confirmed @RT handle
+        'DDGeopolitics',   # DD Geopolitics — confirmed @DDGeopolitics handle
+        'theduran',        # The Duran — geopolitical commentary
+        'SouthFront',      # SouthFront — military conflict coverage
     ],
 }
 
