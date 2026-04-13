@@ -121,6 +121,18 @@ _STOPWORDS = frozenset({
     'stuff', 'truly', 'fingers', 'likes', 'cannot', 'came',
     'allowed', 'cheap', 'files', 'under', 'costs', 'massive',
     'themselves', 'itself', 'yourself', 'ourselves',
+    # User-specified stopword batch
+    'gifts', 'pussy', 'darkness', 'fuckin', 'shithole', 'sneako',
+    'evaporate', 'cursed', 'magyar', 'bosh', 'chads', 'shake',
+    'fins', 'serve', 'totally', 'simple', 'hard', 'rates',
+    'single', 'somewhat', 'basically', 'politically', 'selected',
+    'professor', 'front', 'actions', 'class', 'difference',
+    'becoming', 'finish', 'agree', 'control', 'turned', 'anyways',
+    'especially', 'exist', 'self', 'care', 'tell', 'policy',
+    'school', 'north', 'democracy', 'waste', 'hate', 'internet',
+    'completely', 'instead', 'needs', 'living', 'alive', 'possible',
+    'normal', 'votes', 'imagine', 'food', 'little', 'close',
+    'guess', 'behind', 'family', 'city', 'shes', 'sense',
     # Emotional/discourse words common in imageboard arguments
     'worse', 'worst', 'better', 'best', 'leave', 'leaves', 'left',
     'matter', 'matters', 'mattering', 'exist', 'exists', 'existing',
