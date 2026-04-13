@@ -14,7 +14,7 @@ import json
 import time
 import tarfile
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ── Ensure project root is importable regardless of CWD ──────────────────────
@@ -124,6 +124,7 @@ def cmd_collect(args):
         'telegram':  'collectors.telegram',
         'vk':        'collectors.vk',
         'web':       'collectors.web',
+        'youtube':   'collectors.youtube',
     }
 
     if platform not in COLLECTORS:
@@ -152,6 +153,12 @@ def cmd_collect(args):
     elif platform in ('4chan', 'fourchan'):
         # fourchan collector handles None target internally (uses fourchan_boards)
         targets = [None]
+    elif platform == 'youtube':
+        targets = cfg.get('youtube_channels', [])
+        if not targets:
+            console.print("[yellow]No youtube_channels configured. Use --target or set youtube_channels in config.[/yellow]")
+            return
+        console.print(f"[dim]Collecting from {len(targets)} configured YouTube channels[/dim]")
     else:
         console.print(f"[red]--target required for platform: {platform}[/red]")
         return
@@ -290,6 +297,247 @@ def cmd_analyze(args):
     console.print(f"  Temporal profiled:   [cyan]{temporal_count}[/cyan]")
     console.print(f"  Identity links:      [cyan]{id_links}[/cyan]  Time-correlated: [cyan]{id_corr}[/cyan]")
     console.print(f"  New alerts:          [red]{new_alerts}[/red]")
+
+
+# ── compare ───────────────────────────────────────────────────────────────────
+
+def cmd_compare(args):
+    """
+    Compare narrative patterns between two platform groups within a time window.
+    Surfaces shared keyword clusters and temporal ordering (did source push the
+    narrative before target adopted it?).
+
+    Usage: threadhunt compare --source-group telegram --target-group nitter --window 72h
+    """
+    from collections import Counter
+    from analysis.narrative_clustering import extract_keywords, _greedy_cluster, _top_keywords
+
+    source_plat = args.source_group.lower()
+    target_plat = args.target_group.lower()
+
+    # Parse window e.g. "72h", "7d", "48h"
+    window_str  = (args.window or '72h').lower().strip()
+    if window_str.endswith('h'):
+        window_hours = int(window_str[:-1])
+    elif window_str.endswith('d'):
+        window_hours = int(window_str[:-1]) * 24
+    else:
+        window_hours = 72
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+
+    def _load_posts(platform: str) -> list:
+        """Load recent posts from a platform with keyword extraction."""
+        posts = []
+        with db.get_conn() as conn:
+            for row in db.stream_rows(conn, """
+                SELECT p.id, p.account_id, a.username, p.simhash,
+                       p.content, p.timestamp
+                FROM posts p JOIN accounts a ON a.id = p.account_id
+                WHERE p.platform = ?
+                  AND p.timestamp >= ?
+                  AND p.simhash != 0
+                ORDER BY p.timestamp ASC
+                LIMIT 5000
+            """, (platform, cutoff)):
+                kws = extract_keywords(row['content'] or '')
+                if len(kws) >= 3:
+                    posts.append({
+                        'id':         row['id'],
+                        'account_id': row['account_id'],
+                        'username':   row['username'],
+                        'simhash':    row['simhash'],
+                        'timestamp':  row['timestamp'],
+                        'keywords':   set(kws[:20]),
+                        'content':    (row['content'] or '')[:200],
+                    })
+        return posts
+
+    source_posts = _load_posts(source_plat)
+    target_posts = _load_posts(target_plat)
+
+    console.print(f"\n[bold]Narrative Comparison: [cyan]{source_plat}[/cyan] → [yellow]{target_plat}[/yellow][/bold]")
+    console.print(f"[dim]Window: {window_hours}h  Cutoff: {cutoff[:16]}[/dim]\n")
+
+    if not source_posts:
+        console.print(f"[yellow]No posts found for {source_plat} in last {window_hours}h.[/yellow]")
+        return
+    if not target_posts:
+        console.print(f"[yellow]No posts found for {target_plat} in last {window_hours}h.[/yellow]")
+        return
+
+    # ── Volume summary ────────────────────────────────────────────────────────
+    src_accounts = {p['username'] for p in source_posts}
+    tgt_accounts = {p['username'] for p in target_posts}
+
+    t = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    t.add_column("Group",    style="bold")
+    t.add_column("Platform", style="cyan")
+    t.add_column("Posts",    justify="right")
+    t.add_column("Accounts")
+    t.add_row("Source", source_plat, str(len(source_posts)), ', '.join(sorted(src_accounts)[:5]))
+    t.add_row("Target", target_plat, str(len(target_posts)), ', '.join(sorted(tgt_accounts)[:5]))
+    console.print(t)
+    console.print()
+
+    # ── Per-group top keywords ────────────────────────────────────────────────
+    src_freq: Counter = Counter()
+    tgt_freq: Counter = Counter()
+    for p in source_posts:
+        src_freq.update(p['keywords'])
+    for p in target_posts:
+        tgt_freq.update(p['keywords'])
+
+    src_top = [w for w, _ in src_freq.most_common(15)]
+    tgt_top = [w for w, _ in tgt_freq.most_common(15)]
+
+    kw_table = Table(title="Top Keywords by Group", show_header=True, header_style="bold")
+    kw_table.add_column(f"Source ({source_plat})", style="cyan")
+    kw_table.add_column(f"Target ({target_plat})", style="yellow")
+    for i in range(max(len(src_top), len(tgt_top))):
+        src_w = src_top[i] if i < len(src_top) else ''
+        tgt_w = tgt_top[i] if i < len(tgt_top) else ''
+        kw_table.add_row(src_w, tgt_w)
+    console.print(kw_table)
+    console.print()
+
+    # ── Shared narrative clusters ─────────────────────────────────────────────
+    # Find keywords significant in both groups (appear in both top-30)
+    src_set = set(w for w, _ in src_freq.most_common(30))
+    tgt_set = set(w for w, _ in tgt_freq.most_common(30))
+    shared_kws = src_set & tgt_set
+
+    if not shared_kws:
+        console.print("[dim]No shared keywords in top-30 of each group within this window.[/dim]")
+        console.print("[dim]Try a wider window: --window 168h (7 days)[/dim]")
+        return
+
+    # Score shared keywords by combined frequency
+    shared_scored = sorted(
+        [(kw, src_freq[kw] + tgt_freq[kw]) for kw in shared_kws],
+        key=lambda x: x[1], reverse=True
+    )
+
+    console.print(f"[bold green]Shared narrative keywords ({len(shared_kws)} found):[/bold green]")
+
+    shared_table = Table(show_header=True, header_style="bold")
+    shared_table.add_column("Keyword",                       style="green bold")
+    shared_table.add_column(f"{source_plat} freq", justify="right", style="cyan")
+    shared_table.add_column(f"{target_plat} freq", justify="right", style="yellow")
+    shared_table.add_column("First in source",               style="dim")
+    shared_table.add_column("First in target",               style="dim")
+    shared_table.add_column("Lead time",                     style="magenta")
+
+    coord_signals = 0
+    for kw, _ in shared_scored[:15]:
+        # Find first post containing this keyword in each group
+        src_first = next(
+            (p for p in source_posts if kw in p['keywords']), None
+        )
+        tgt_first = next(
+            (p for p in target_posts if kw in p['keywords']), None
+        )
+
+        src_ts_str = (src_first['timestamp'] or '')[:16] if src_first else '—'
+        tgt_ts_str = (tgt_first['timestamp'] or '')[:16] if tgt_first else '—'
+
+        lead_str = ''
+        if src_first and tgt_first:
+            src_dt = _parse_ts_cmp(src_first['timestamp'])
+            tgt_dt = _parse_ts_cmp(tgt_first['timestamp'])
+            if src_dt and tgt_dt:
+                delta = tgt_dt - src_dt
+                hours = delta.total_seconds() / 3600
+                if hours > 0:
+                    lead_str = f"+{hours:.0f}h (source first)"
+                    coord_signals += 1
+                elif hours < 0:
+                    lead_str = f"{hours:.0f}h (target first)"
+                else:
+                    lead_str = "simultaneous"
+
+        shared_table.add_row(
+            kw,
+            str(src_freq[kw]),
+            str(tgt_freq[kw]),
+            src_ts_str,
+            tgt_ts_str,
+            lead_str,
+        )
+
+    console.print(shared_table)
+    console.print()
+
+    # ── Narrative clusters spanning both groups ───────────────────────────────
+    min_overlap = config.get('narrative_min_keyword_overlap', 3)
+    all_posts   = source_posts + target_posts
+    clusters    = _greedy_cluster(all_posts, min_overlap=min_overlap)
+
+    cross_clusters = []
+    for cluster, ckws in clusters:
+        src_in  = [p for p in cluster if p['username'] in src_accounts]
+        tgt_in  = [p for p in cluster if p['username'] in tgt_accounts]
+        if src_in and tgt_in:
+            top5 = _top_keywords(cluster, n=5)
+            cross_clusters.append((top5, src_in, tgt_in, cluster))
+
+    if cross_clusters:
+        console.print(f"[bold red]Cross-group narrative clusters: {len(cross_clusters)}[/bold red]")
+        for top5, src_in, tgt_in, cluster in cross_clusters[:10]:
+            src_users = ', '.join(sorted({p['username'] for p in src_in})[:3])
+            tgt_users = ', '.join(sorted({p['username'] for p in tgt_in})[:3])
+
+            # Temporal lead time from first source to first target post
+            src_times = sorted(p['timestamp'] for p in src_in if p.get('timestamp'))
+            tgt_times = sorted(p['timestamp'] for p in tgt_in if p.get('timestamp'))
+            lead_str  = ''
+            if src_times and tgt_times:
+                src_dt = _parse_ts_cmp(src_times[0])
+                tgt_dt = _parse_ts_cmp(tgt_times[0])
+                if src_dt and tgt_dt:
+                    hours = (tgt_dt - src_dt).total_seconds() / 3600
+                    if hours > 0.5:
+                        lead_str = f"  [magenta]source led by {hours:.0f}h[/magenta]"
+                    elif hours < -0.5:
+                        lead_str = f"  [dim]target led by {abs(hours):.0f}h[/dim]"
+
+            console.print(
+                f"  [green]{', '.join(top5[:3])}[/green]  "
+                f"[cyan]{source_plat}:[/cyan]{src_users} ({len(src_in)}p)  "
+                f"[yellow]{target_plat}:[/yellow]{tgt_users} ({len(tgt_in)}p)"
+                f"{lead_str}"
+            )
+        console.print()
+
+    # ── Summary verdict ───────────────────────────────────────────────────────
+    if coord_signals >= 3 or len(cross_clusters) >= 2:
+        verdict = "[bold red]HIGH[/bold red] — source platform consistently leads target. Consistent with narrative seeding pipeline."
+    elif coord_signals >= 1 or cross_clusters:
+        verdict = "[bold yellow]MEDIUM[/bold yellow] — some shared narratives with source leading. Monitor for escalation."
+    else:
+        verdict = "[dim]LOW[/dim] — no clear directional narrative flow in this window."
+
+    console.print(Panel(
+        f"Shared keywords: [green]{len(shared_kws)}[/green]  "
+        f"Cross-group clusters: [green]{len(cross_clusters)}[/green]  "
+        f"Source-leads signals: [magenta]{coord_signals}[/magenta]\n"
+        f"Verdict: {verdict}",
+        title="Comparison Summary",
+        border_style="dim",
+    ))
+
+
+def _parse_ts_cmp(ts: str):
+    """Parse ISO timestamp for compare command (local helper)."""
+    if not ts:
+        return None
+    ts = ts.rstrip('Z').split('+')[0]
+    for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M'):
+        try:
+            return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
 
 
 # ── alert ─────────────────────────────────────────────────────────────────────
@@ -814,7 +1062,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ── collect
     p_collect = sub.add_parser('collect', help='Collect posts from a platform')
     p_collect.add_argument('--platform', required=True,
-                           help='nitter | 4chan | telegram | vk | web')
+                           help='nitter | twitter | 4chan | telegram | vk | web | youtube')
     p_collect.add_argument('--target',   required=True,
                            help='Username, board, channel, or URL')
     p_collect.add_argument('--keyword',  help='Filter to posts containing this keyword')
@@ -860,6 +1108,15 @@ def build_parser() -> argparse.ArgumentParser:
                       help='keyword | account | hashtag (default: keyword)')
     p_wa.add_argument('--platform', help='Limit to a specific platform')
 
+    # ── compare
+    p_compare = sub.add_parser('compare', help='Compare narratives across two platform groups')
+    p_compare.add_argument('--source-group', required=True,
+                           help='Source platform  (e.g. telegram)')
+    p_compare.add_argument('--target-group', required=True,
+                           help='Target platform  (e.g. nitter)')
+    p_compare.add_argument('--window', default='72h',
+                           help='Time window, e.g. 24h, 48h, 7d  (default: 72h)')
+
     # ── export-state
     sub.add_parser('export-state', help='Export DB + config to tar.gz')
 
@@ -880,6 +1137,7 @@ COMMAND_MAP = {
     'status':       cmd_status,
     'watch':        cmd_watch,
     'watch-add':    cmd_watch_add,
+    'compare':      cmd_compare,
     'export-state': cmd_export_state,
     'import-state': cmd_import_state,
 }

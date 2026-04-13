@@ -83,6 +83,14 @@ DEFAULT_CONFIG = {
         'tass_agency',
         'sputnik_russia',
     ],
+
+    # YouTube: channels to monitor by default (no --target required).
+    # Mix of Western-facing Russian state media and relevant disinfo vectors.
+    'youtube_channels': [
+        'TheGrayzone',
+        'RT',
+        'DDGeopolitics',
+    ],
 }
 
 _config: dict | None = None
