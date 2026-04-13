@@ -8,7 +8,12 @@ import re
 
 def simhash(text: str, bits: int = 64) -> int:
     """
-    64-bit SimHash fingerprint of text.
+    64-bit SimHash fingerprint of text, stored as a SIGNED 64-bit integer.
+
+    SQLite INTEGER is signed 64-bit (-2^63 to 2^63-1). We compute the
+    fingerprint as unsigned, then reinterpret as two's complement so it
+    fits in a SQLite INTEGER column without overflow.
+
     Hamming distance <= 5 => near-duplicate.
     """
     if not text or not text.strip():
@@ -33,12 +38,22 @@ def simhash(text: str, bits: int = 64) -> int:
         if v[i] > 0:
             fingerprint |= (1 << i)
 
+    # Reinterpret as signed two's complement so value fits in SQLite INTEGER.
+    # Values in [2^63, 2^64-1] map to [-2^63, -1] preserving all bit patterns.
+    if fingerprint >= (1 << 63):
+        fingerprint -= (1 << 64)
+
     return fingerprint
 
 
 def hamming_distance(a: int, b: int) -> int:
-    """Bit count of XOR — number of differing bits."""
-    return bin(a ^ b).count('1')
+    """
+    Bit count of differing bits between two 64-bit SimHash values.
+    Handles signed integers (stored as SQLite INTEGER) by masking to 64 bits
+    before XOR so negative values compare correctly.
+    """
+    _MASK64 = (1 << 64) - 1
+    return bin((a & _MASK64) ^ (b & _MASK64)).count('1')
 
 
 def _tokenize(text: str) -> list:

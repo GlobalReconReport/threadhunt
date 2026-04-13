@@ -126,19 +126,44 @@ def collect(session, target: str = None, keyword: str = None, verbose_cb=None) -
 
         catalog = get_catalog(session, board)
         if not catalog:
+            logger.warning("4chan: /%s/ catalog empty or unreachable", board)
+            if verbose_cb:
+                verbose_cb(f"/{board}/: catalog empty or unreachable — skipping")
             continue
 
+        logger.info("4chan: /%s/ catalog has %d threads", board, len(catalog))
+
         with db.get_conn() as conn:
-            keywords = [keyword] if keyword else _get_watchlist_keywords(conn)
+            # keyword arg = explicit filter (CLI --keyword flag)
+            # watchlist keywords = post-level filter only (OPs rarely use exact terms)
+            explicit_keyword = keyword
+            watchlist_keywords = [] if explicit_keyword else _get_watchlist_keywords(conn)
 
-        matched_threads = [t for t in catalog if thread_matches_keywords(t, keywords)]
-
-        if verbose_cb:
-            verbose_cb(f"/{board}/: {len(matched_threads)} matching threads")
+        # Catalog-level filter ONLY when an explicit --keyword was passed.
+        # Watchlist keywords are applied at individual post level below —
+        # 4chan OPs rarely contain the exact phrases used in watchlists.
+        if explicit_keyword:
+            matched_threads = [t for t in catalog
+                               if thread_matches_keywords(t, [explicit_keyword])]
+            logger.info("4chan: /%s/ %d/%d threads match explicit keyword '%s'",
+                        board, len(matched_threads), len(catalog), explicit_keyword)
+            if verbose_cb:
+                verbose_cb(f"/{board}/: {len(matched_threads)}/{len(catalog)} threads match '{explicit_keyword}'")
+        else:
+            # No explicit filter — collect all threads, filter posts by watchlist below
+            matched_threads = catalog
+            if verbose_cb:
+                verb = f"watchlist({len(watchlist_keywords)} kw)" if watchlist_keywords else "all posts"
+                verbose_cb(f"/{board}/: collecting all {len(catalog)} threads, filtering by {verb}")
 
         # Ensure a synthetic account for this board
         with db.get_conn() as conn:
             account_id = db.upsert_account(conn, f'4chan_{board}', f'4chan/{board}')
+
+        threads_fetched = 0
+        threads_404 = 0
+        posts_text = 0
+        posts_imageonly = 0
 
         for thread in matched_threads:
             if new_total >= cap:
@@ -149,20 +174,40 @@ def collect(session, target: str = None, keyword: str = None, verbose_cb=None) -
                 continue
 
             if verbose_cb:
-                verbose_cb(f"Archiving /{board}/ thread #{thread_no}")
+                verbose_cb(f"/{board}/ thread #{thread_no} ({new_total} collected so far)")
 
             posts = get_thread(session, board, thread_no)
             if not posts:
+                threads_404 += 1
+                logger.debug("4chan: /%s/%s returned no posts (404 or empty)", board, thread_no)
                 continue
 
+            threads_fetched += 1
             with db.get_conn() as conn:
                 for post in posts:
                     if new_total >= cap:
                         break
+                    # Track image-only posts for diagnostics
+                    raw_com = post.get('com', '')
+                    content = strip_html(raw_com).strip()
+                    if not content:
+                        posts_imageonly += 1
+                        continue
+                    # Post-level keyword filter (watchlist or explicit keyword)
+                    filter_kws = watchlist_keywords if not explicit_keyword else []
+                    if filter_kws and not any(kw.lower() in content.lower()
+                                             for kw in filter_kws):
+                        continue
+                    posts_text += 1
                     if _ingest_post(conn, account_id, board, post):
                         new_total += 1
 
             time.sleep(1)  # 4chan API rate limit guidance: 1 req/sec
+
+        logger.info(
+            "4chan: /%s/ fetched=%d 404=%d text_posts=%d image_only=%d stored=%d",
+            board, threads_fetched, threads_404, posts_text, posts_imageonly, new_total
+        )
 
     logger.info("4chan: %d new posts collected", new_total)
     return new_total
