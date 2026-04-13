@@ -67,6 +67,9 @@ _STOPWORDS = frozenset({
     'going', 'comes', 'come', 'give', 'gave', 'gets', 'getting',
     'place', 'point', 'part', 'case', 'fact', 'side', 'kind',
     'number', 'level', 'area', 'high', 'huge', 'real', 'small',
+    'system', 'theater', 'theatre', 'understand', 'understanding',
+    'bosh', 'dont', 'wont', 'cant', 'isnt', 'wasnt', 'doesnt',
+    'youre', 'theyre', 'were', 'were', 'heres', 'thats', 'whats',
     # YouTube / media metadata (bleed from titles and descriptions)
     'episode', 'series', 'video', 'youtube', 'watch', 'channel',
     'subscribe', 'playlist', 'stream', 'podcast', 'interview', 'clip',
