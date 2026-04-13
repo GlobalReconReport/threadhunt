@@ -85,11 +85,12 @@ DEFAULT_CONFIG = {
     ],
 
     # YouTube: channels to monitor by default (no --target required).
+    # Use the exact @handle (case-sensitive as YouTube has it).
     # Mix of Western-facing Russian state media and relevant disinfo vectors.
     'youtube_channels': [
-        'TheGrayzone',
-        'RT',
-        'DDGeopolitics',
+        'grayzone',      # The Grayzone — confirmed @grayzone handle
+        'RT',            # RT English — confirmed @RT handle
+        'DDGeopolitics', # DD Geopolitics — confirmed @DDGeopolitics handle
     ],
 }
 
