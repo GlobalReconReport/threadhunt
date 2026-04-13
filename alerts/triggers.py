@@ -296,7 +296,7 @@ def check_scheduled_accounts(conn) -> int:
           AND a.posting_entropy < ?
           AND a.platform IN ('telegram', 'nitter', 'twitter', 'vk')
         GROUP BY a.id
-        HAVING post_count >= ?
+        HAVING COUNT(p.id) >= ?
         ORDER BY a.posting_entropy ASC
         LIMIT 50
     """, (threshold_entropy, min_posts)):
