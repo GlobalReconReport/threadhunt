@@ -1,0 +1,51 @@
+# ── Runtime data — NEVER commit ───────────────────────────────────────────────
+data/
+logs/
+
+# ── Database files ────────────────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ── State exports ─────────────────────────────────────────────────────────────
+*.tar.gz
+*.zip
+
+# ── Secrets / environment ─────────────────────────────────────────────────────
+.env
+*.env
+.env.*
+secrets.json
+credentials.json
+
+# ── Python artifacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── OS junk ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor artifacts ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
