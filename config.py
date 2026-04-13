@@ -28,6 +28,15 @@ DEFAULT_CONFIG = {
     'collector_post_cap':   500,
     'fourchan_post_cap':    1000,
 
+    # Imageboard-specific clustering constraints
+    # On anonymous platforms (4chan/*) coordination signal = same UNUSUAL keyword
+    # appearing in FEW threads, not a common word appearing in many threads.
+    # max_cluster_sources caps how many distinct threads can form one cluster;
+    # any cluster larger than this is generic vocabulary, not coordination.
+    'imageboard_max_cluster_sources': 20,
+    # 4chan threads age out in hours; tighter window cuts cross-thread noise
+    'imageboard_time_window_hours': 12,
+
     # Watch mode
     'watch_refresh_seconds': 60,
 

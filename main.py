@@ -640,6 +640,7 @@ def cmd_report(args):
 
 def _print_tree_report(platform, keyword, time_window):
     from analysis.campaign_engine import get_active_campaigns, get_campaign_posts
+    from analysis.narrative_clustering import extract_keywords as _nc_kws
 
     with db.get_conn() as conn:
         campaigns = get_active_campaigns(conn)
@@ -675,11 +676,16 @@ def _print_tree_report(platform, keyword, time_window):
             # campaign displays the same set of cluster posts.
             camp_kw = (camp.get('keyword') or '').lower()
             if camp_kw:
-                posts = [p for p in posts
-                         if camp_kw in (p.get('content') or '').lower()]
+                # Check raw content text (English) OR extracted keywords
+                # (handles Cyrillic-normalized terms: "iran" won't appear
+                # verbatim in Russian text but will be in the keyword set).
+                def _post_has_kw(p, kw=camp_kw):
+                    content = (p.get('content') or '').lower()
+                    return kw in content or kw in _nc_kws(content)
+                posts = [p for p in posts if _post_has_kw(p)]
             posts = posts[:10]
             if not posts:
-                camp_node.add("[dim]no posts containing keyword[/dim]")
+                camp_node.add("[dim]no posts[/dim]")
                 continue
 
             # Group posts by account

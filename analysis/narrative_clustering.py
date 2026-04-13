@@ -117,6 +117,36 @@ _STOPWORDS = frozenset({
     'shit', 'fuck', 'fucking', 'fucker', 'fucked', 'fucks',
     'crap', 'damn', 'hell', 'piss', 'cock', 'dick', 'ass', 'arse',
     'shit', 'shits', 'shitty', 'bullshit',
+    # Final sweep of imageboard discourse noise
+    'stuff', 'truly', 'fingers', 'likes', 'cannot', 'came',
+    'allowed', 'cheap', 'files', 'under', 'costs', 'massive',
+    'themselves', 'itself', 'yourself', 'ourselves',
+    # Emotional/discourse words common in imageboard arguments
+    'worse', 'worst', 'better', 'best', 'leave', 'leaves', 'left',
+    'matter', 'matters', 'mattering', 'exist', 'exists', 'existing',
+    'self', 'care', 'cares', 'caring', 'waste', 'wasting',
+    'hate', 'hates', 'hating', 'hated',
+    'alive', 'living', 'lived', 'lives', 'life',
+    'normal', 'possible', 'probably', 'close', 'closed', 'closing',
+    'guess', 'guessing', 'instead', 'needs', 'needing',
+    'becoming', 'become', 'becomes', 'became',
+    'completely', 'literally', 'actually', 'physically',
+    'mentally', 'mental', 'emotional', 'personal',
+    'basically', 'generally', 'obviously', 'clearly',
+    'internet', 'online', 'website', 'email',
+    'school', 'schools', 'college', 'university',
+    'insurance', 'hiding', 'bunch', 'kids', 'child',
+    'months', 'month', 'week', 'years', 'hours', 'days',
+    'makes', 'made', 'making', 'taken', 'took', 'stops',
+    'either', 'neither', 'turned', 'turns', 'turning',
+    'agree', 'agreed', 'agreeing', 'disagree',
+    'behind', 'beside', 'below', 'above', 'across',
+    'class', 'finish', 'finished', 'anyways', 'anyway',
+    'difference', 'different', 'similar', 'same', 'equal',
+    'family', 'brother', 'sister', 'father', 'mother',
+    'lost', 'lose', 'losing', 'gain', 'gaining',
+    'sense', 'thought', 'think', 'thinking', 'feels', 'feeling',
+    'north', 'south', 'east', 'west',  # compass directions alone = noise
     # 4chan culture / meme terms (board-culture noise, not coordination signals)
     'anon', 'nona', 'yeah', 'yep', 'nope',
     'lmao', 'lmfao', 'desu', 'bump', 'sage',
@@ -298,6 +328,13 @@ def run(progress_cb=None) -> int:
     min_sources       = config.get('narrative_min_sources', 3)
     min_platforms     = config.get('narrative_min_platforms', 2)
 
+    # Imageboard-specific tighter constraints.
+    # On 4chan each "account" is one thread (anonymous posters get per-thread IDs).
+    # A keyword appearing in 390 threads = common English word, not coordination.
+    # Coordination on imageboards = same UNUSUAL term in 3–20 distinct threads.
+    ib_max_sources   = config.get('imageboard_max_cluster_sources', 20)
+    ib_window_hours  = config.get('imageboard_time_window_hours', 12)
+
     with db.get_conn() as conn:
         platforms = [
             row[0] for row in
@@ -310,9 +347,14 @@ def run(progress_cb=None) -> int:
     for i, platform in enumerate(platforms):
         if progress_cb:
             progress_cb(i + 1, n + 1)
+        is_imageboard = platform.startswith('4chan')
         with db.get_conn() as conn:
             total_new += _detect_per_platform(
-                conn, platform, time_window_hours, min_overlap, min_sources
+                conn, platform,
+                window_hours = ib_window_hours  if is_imageboard else time_window_hours,
+                min_overlap  = min_overlap,
+                min_sources  = min_sources,
+                max_sources  = ib_max_sources if is_imageboard else 10_000,
             )
 
     # Cross-platform pass (separate step)
@@ -330,11 +372,16 @@ def run(progress_cb=None) -> int:
 # ── Per-platform detection ────────────────────────────────────────────────────
 
 def _detect_per_platform(conn, platform: str, window_hours: int,
-                          min_overlap: int, min_sources: int) -> int:
+                          min_overlap: int, min_sources: int,
+                          max_sources: int = 10_000) -> int:
     """
     Within-platform narrative cluster detection.
-    Finds groups of posts from ≥min_sources distinct accounts that share
-    ≥min_overlap significant keywords in the time window.
+    Finds groups of posts from ≥min_sources AND ≤max_sources distinct accounts
+    that share ≥min_overlap significant keywords in the time window.
+
+    max_sources is critical for anonymous imageboards: a keyword appearing in
+    390 threads is common vocabulary, not coordination.  Set to
+    imageboard_max_cluster_sources (default 20) for 4chan/* platforms.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
 
@@ -367,7 +414,13 @@ def _detect_per_platform(conn, platform: str, window_hours: int,
 
     for cluster, ckws in clusters:
         unique_accounts = {p['account_id'] for p in cluster}
-        if len(unique_accounts) < min_sources:
+        n_accts = len(unique_accounts)
+        if n_accts < min_sources:
+            continue
+        # Too many sources = generic vocabulary on this platform, not coordination.
+        # On 4chan this prevents common English words from firing just because
+        # they appeared in hundreds of threads during the collection window.
+        if n_accts > max_sources:
             continue
 
         # Skip near-duplicates — simhash engine handles those
@@ -443,14 +496,25 @@ def _detect_cross_platform(conn, window_hours: int, min_overlap: int,
         return 0
 
     # Cluster within each platform to get per-platform narrative blobs.
-    # We include even single-post blobs so they can contribute to cross-platform
-    # matches (one post on Telegram + one post on 4chan about the same topic
-    # is already meaningful when it's not near-duplicate).
+    # For anonymous imageboards, discard blobs that exceed the max-sources cap —
+    # they represent generic vocabulary, not seeded narratives.  A large 4chan
+    # blob matching any Telegram/YouTube post on a common word would otherwise
+    # produce hundreds of false cross-platform "coordination" clusters.
+    ib_max = config.get('imageboard_max_cluster_sources', 20)
+
     platform_blobs: dict = {}
     for plat, posts in platform_posts.items():
         blobs = _greedy_cluster(posts, min_overlap)
-        # Keep all blobs with ≥1 post (singletons welcome for cross-platform)
-        platform_blobs[plat] = [(ckws, cluster) for cluster, ckws in blobs]
+        is_ib = plat.startswith('4chan')
+        filtered = []
+        for cluster, ckws in blobs:
+            n = len({p['account_id'] for p in cluster})
+            if is_ib and n > ib_max:
+                continue  # too generic for this imageboard
+            if n < 1:
+                continue
+            filtered.append((ckws, cluster))
+        platform_blobs[plat] = filtered
 
     all_platforms = list(platform_blobs.keys())
     if len(all_platforms) < min_platforms:
@@ -648,8 +712,17 @@ def _save_narrative_campaign(conn, cluster_key: str, platform: str,
                                cluster: list, unique_accounts: set,
                                confidence: float, top_keywords: list):
     """Insert a narrative campaign + cluster membership rows."""
-    now     = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Pick the most-common keyword that actually appears in ≥1 cluster post.
+    # top_keywords may contain Cyrillic-normalized forms (e.g. "iran" from
+    # "иран") that don't match raw content text.  Validated against the
+    # extracted keyword sets stored on each post dict — those ARE normalized.
     keyword = top_keywords[0] if top_keywords else ''
+    for candidate in top_keywords:
+        if any(candidate in p.get('keywords', set()) for p in cluster):
+            keyword = candidate
+            break
 
     timestamps = sorted(p['timestamp'] for p in cluster if p.get('timestamp'))
     first_seen = timestamps[0]  if timestamps else now
