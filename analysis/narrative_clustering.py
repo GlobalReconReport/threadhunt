@@ -53,6 +53,24 @@ _STOPWORDS = frozenset({
     'read', 'source', 'link', 'today', 'time', 'year', 'week', 'days',
     'said', 'says', 'know', 'want', 'people', 'would', 'could', 'should',
     'still', 'first', 'last', 'used', 'make', 'made', 'take', 'another',
+    # English discourse / filler words (cross-platform noise)
+    'actually', 'really', 'comes', 'come', 'live', 'speak', 'believe',
+    'while', 'other', 'think', 'need', 'look', 'good', 'work', 'next',
+    'thing', 'going', 'right', 'these', 'those', 'them', 'they', 'very',
+    'getting', 'doing', 'talking', 'saying', 'telling', 'something',
+    'nothing', 'everything', 'anything', 'anyone', 'someone', 'everyone',
+    'never', 'always', 'again', 'maybe', 'really', 'pretty', 'quite',
+    'around', 'during', 'while', 'until', 'since', 'though', 'although',
+    'however', 'because', 'against', 'without', 'within', 'between',
+    # Generic situational / filler context (no narrative specificity)
+    'long', 'local', 'situation', 'happened', 'happen', 'happens',
+    'going', 'comes', 'come', 'give', 'gave', 'gets', 'getting',
+    'place', 'point', 'part', 'case', 'fact', 'side', 'kind',
+    'number', 'level', 'area', 'high', 'huge', 'real', 'small',
+    # YouTube / media metadata (bleed from titles and descriptions)
+    'episode', 'series', 'video', 'youtube', 'watch', 'channel',
+    'subscribe', 'playlist', 'stream', 'podcast', 'interview', 'clip',
+    'part', 'show', 'full', 'live', 'weekly', 'daily', 'official',
     # Russian (Cyrillic — matched when posts contain Russian text)
     # Grammar / function words
     'что', 'это', 'для', 'как', 'все', 'они', 'или', 'его', 'был', 'при',
