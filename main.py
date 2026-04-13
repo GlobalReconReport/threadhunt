@@ -668,9 +668,18 @@ def _print_tree_report(platform, keyword, time_window):
             )
             camp_node = root.add(camp_label)
 
-            posts = get_campaign_posts(camp['id'], conn, limit=10)
+            posts = get_campaign_posts(camp['id'], conn, limit=50)
+            # Filter to posts that actually contain the campaign keyword —
+            # get_campaign_posts returns all posts in the cluster, but multiple
+            # clusters can share the same campaign, so without filtering every
+            # campaign displays the same set of cluster posts.
+            camp_kw = (camp.get('keyword') or '').lower()
+            if camp_kw:
+                posts = [p for p in posts
+                         if camp_kw in (p.get('content') or '').lower()]
+            posts = posts[:10]
             if not posts:
-                camp_node.add("[dim]no posts[/dim]")
+                camp_node.add("[dim]no posts containing keyword[/dim]")
                 continue
 
             # Group posts by account
