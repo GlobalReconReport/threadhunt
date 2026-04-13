@@ -69,13 +69,14 @@ def infer_timezone_offset(hour_counts: list) -> int | None:
             min_activity = window
             best_start = start
 
-    # Sleep trough starts around 01:00 local, so:
-    # best_start (UTC) = 01:00 local → local = best_start - 1
-    # UTC offset = local - UTC = (best_start - 1) - best_start = -1
-    # More precisely: if trough at UTC hour X, local 01:00 = X, so offset = X - 1
-    offset = (best_start - 1) % 24
+    # If the sleep trough starts at UTC hour best_start, and local 01:00 = best_start UTC:
+    #   UTC + offset = local  →  best_start + offset = 1  →  offset = 1 - best_start
+    # Examples:
+    #   Moscow UTC+3: sleep starts 22:00 UTC → offset = 1 - 22 = -21 → mod 24 = 3 ✓
+    #   New York UTC-5: sleep starts 06:00 UTC → offset = 1 - 6 = -5 → mod 24 = 19 → -5 ✓
+    offset = (1 - best_start) % 24
     if offset > 12:
-        offset -= 24   # Convert to signed offset
+        offset -= 24   # Convert to signed offset (-12..+12 range)
     return offset
 
 
