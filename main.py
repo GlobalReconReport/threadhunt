@@ -303,17 +303,36 @@ def cmd_analyze(args):
 
 def cmd_compare(args):
     """
-    Compare narrative patterns between two platform groups within a time window.
+    Compare narrative patterns between two groups within a time window.
     Surfaces shared keyword clusters and temporal ordering (did source push the
     narrative before target adopted it?).
 
-    Usage: threadhunt compare --source-group telegram --target-group nitter --window 72h
+    Platform mode:  threadhunt compare --source-group telegram --target-group nitter --window 72h
+    Account mode:   threadhunt compare --source-accounts PressTV,s_m_marandi --target-accounts joekent16jan19,TuckerCarlson --window 168h
     """
     from collections import Counter
     from analysis.narrative_clustering import extract_keywords, _greedy_cluster, _top_keywords
 
-    source_plat = args.source_group.lower()
-    target_plat = args.target_group.lower()
+    # ── Resolve mode: account list or platform group ──────────────────────────
+    src_usernames = [u.strip() for u in args.source_accounts.split(',')] \
+        if getattr(args, 'source_accounts', None) else []
+    tgt_usernames = [u.strip() for u in args.target_accounts.split(',')] \
+        if getattr(args, 'target_accounts', None) else []
+
+    account_mode = bool(src_usernames or tgt_usernames)
+
+    if account_mode:
+        if not src_usernames or not tgt_usernames:
+            console.print("[red]--source-accounts and --target-accounts must both be provided.[/red]")
+            return
+        source_label = ', '.join(src_usernames)
+        target_label = ', '.join(tgt_usernames)
+    else:
+        if not getattr(args, 'source_group', None) or not getattr(args, 'target_group', None):
+            console.print("[red]Provide either --source-group/--target-group or --source-accounts/--target-accounts.[/red]")
+            return
+        source_label = args.source_group.lower()
+        target_label = args.target_group.lower()
 
     # Parse window e.g. "72h", "7d", "48h"
     window_str  = (args.window or '72h').lower().strip()
@@ -326,8 +345,7 @@ def cmd_compare(args):
 
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
 
-    def _load_posts(platform: str) -> list:
-        """Load recent posts from a platform with keyword extraction."""
+    def _load_posts_by_platform(platform: str) -> list:
         posts = []
         with db.get_conn() as conn:
             for row in db.stream_rows(conn, """
@@ -353,30 +371,71 @@ def cmd_compare(args):
                     })
         return posts
 
-    source_posts = _load_posts(source_plat)
-    target_posts = _load_posts(target_plat)
+    def _load_posts_by_accounts(usernames: list) -> list:
+        """Load posts for a specific list of usernames (case-insensitive)."""
+        posts = []
+        placeholders = ','.join('?' * len(usernames))
+        lower_names   = [u.lower() for u in usernames]
+        with db.get_conn() as conn:
+            for row in db.stream_rows(conn, f"""
+                SELECT p.id, p.account_id, a.username, p.simhash,
+                       p.content, p.timestamp
+                FROM posts p JOIN accounts a ON a.id = p.account_id
+                WHERE LOWER(a.username) IN ({placeholders})
+                  AND p.timestamp >= ?
+                  AND p.simhash != 0
+                ORDER BY p.timestamp ASC
+                LIMIT 5000
+            """, (*lower_names, cutoff)):
+                kws = extract_keywords(row['content'] or '')
+                if len(kws) >= 3:
+                    posts.append({
+                        'id':         row['id'],
+                        'account_id': row['account_id'],
+                        'username':   row['username'],
+                        'simhash':    row['simhash'],
+                        'timestamp':  row['timestamp'],
+                        'keywords':   set(kws[:20]),
+                        'content':    (row['content'] or '')[:200],
+                    })
+        return posts
 
-    console.print(f"\n[bold]Narrative Comparison: [cyan]{source_plat}[/cyan] → [yellow]{target_plat}[/yellow][/bold]")
+    if account_mode:
+        source_posts = _load_posts_by_accounts(src_usernames)
+        target_posts = _load_posts_by_accounts(tgt_usernames)
+    else:
+        source_posts = _load_posts_by_platform(source_label)
+        target_posts = _load_posts_by_platform(target_label)
+
+    console.print(f"\n[bold]Narrative Comparison: [cyan]{source_label}[/cyan] → [yellow]{target_label}[/yellow][/bold]")
     console.print(f"[dim]Window: {window_hours}h  Cutoff: {cutoff[:16]}[/dim]\n")
 
     if not source_posts:
-        console.print(f"[yellow]No posts found for {source_plat} in last {window_hours}h.[/yellow]")
+        console.print(f"[yellow]No posts found for source ({source_label}) in last {window_hours}h.[/yellow]")
         return
     if not target_posts:
-        console.print(f"[yellow]No posts found for {target_plat} in last {window_hours}h.[/yellow]")
+        console.print(f"[yellow]No posts found for target ({target_label}) in last {window_hours}h.[/yellow]")
         return
 
     # ── Volume summary ────────────────────────────────────────────────────────
     src_accounts = {p['username'] for p in source_posts}
     tgt_accounts = {p['username'] for p in target_posts}
 
+    # In platform mode show platform name; in account mode show the accounts seen
+    src_plat_col = source_label if not account_mode else ', '.join(sorted(src_accounts)[:3])
+    tgt_plat_col = target_label if not account_mode else ', '.join(sorted(tgt_accounts)[:3])
+
     t = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
     t.add_column("Group",    style="bold")
-    t.add_column("Platform", style="cyan")
+    t.add_column("Accounts" if account_mode else "Platform", style="cyan")
     t.add_column("Posts",    justify="right")
-    t.add_column("Accounts")
-    t.add_row("Source", source_plat, str(len(source_posts)), ', '.join(sorted(src_accounts)[:5]))
-    t.add_row("Target", target_plat, str(len(target_posts)), ', '.join(sorted(tgt_accounts)[:5]))
+    t.add_column("Distinct accounts" if not account_mode else "Posts per account")
+    src_detail = ', '.join(sorted(src_accounts)[:5]) if not account_mode \
+        else '  '.join(f"{u}:{sum(1 for p in source_posts if p['username']==u)}" for u in sorted(src_accounts)[:5])
+    tgt_detail = ', '.join(sorted(tgt_accounts)[:5]) if not account_mode \
+        else '  '.join(f"{u}:{sum(1 for p in target_posts if p['username']==u)}" for u in sorted(tgt_accounts)[:5])
+    t.add_row("Source", src_plat_col, str(len(source_posts)), src_detail)
+    t.add_row("Target", tgt_plat_col, str(len(target_posts)), tgt_detail)
     console.print(t)
     console.print()
 
@@ -391,9 +450,11 @@ def cmd_compare(args):
     src_top = [w for w, _ in src_freq.most_common(15)]
     tgt_top = [w for w, _ in tgt_freq.most_common(15)]
 
+    src_col_label = source_label if len(source_label) <= 30 else source_label[:27] + '…'
+    tgt_col_label = target_label if len(target_label) <= 30 else target_label[:27] + '…'
     kw_table = Table(title="Top Keywords by Group", show_header=True, header_style="bold")
-    kw_table.add_column(f"Source ({source_plat})", style="cyan")
-    kw_table.add_column(f"Target ({target_plat})", style="yellow")
+    kw_table.add_column(f"Source ({src_col_label})", style="cyan")
+    kw_table.add_column(f"Target ({tgt_col_label})", style="yellow")
     for i in range(max(len(src_top), len(tgt_top))):
         src_w = src_top[i] if i < len(src_top) else ''
         tgt_w = tgt_top[i] if i < len(tgt_top) else ''
@@ -421,12 +482,12 @@ def cmd_compare(args):
     console.print(f"[bold green]Shared narrative keywords ({len(shared_kws)} found):[/bold green]")
 
     shared_table = Table(show_header=True, header_style="bold")
-    shared_table.add_column("Keyword",                       style="green bold")
-    shared_table.add_column(f"{source_plat} freq", justify="right", style="cyan")
-    shared_table.add_column(f"{target_plat} freq", justify="right", style="yellow")
-    shared_table.add_column("First in source",               style="dim")
-    shared_table.add_column("First in target",               style="dim")
-    shared_table.add_column("Lead time",                     style="magenta")
+    shared_table.add_column("Keyword",                              style="green bold")
+    shared_table.add_column(f"{src_col_label} freq", justify="right", style="cyan")
+    shared_table.add_column(f"{tgt_col_label} freq", justify="right", style="yellow")
+    shared_table.add_column("First in source",                      style="dim")
+    shared_table.add_column("First in target",                      style="dim")
+    shared_table.add_column("Lead time",                            style="magenta")
 
     coord_signals = 0
     for kw, _ in shared_scored[:15]:
@@ -503,8 +564,8 @@ def cmd_compare(args):
 
             console.print(
                 f"  [green]{', '.join(top5[:3])}[/green]  "
-                f"[cyan]{source_plat}:[/cyan]{src_users} ({len(src_in)}p)  "
-                f"[yellow]{target_plat}:[/yellow]{tgt_users} ({len(tgt_in)}p)"
+                f"[cyan]source:[/cyan]{src_users} ({len(src_in)}p)  "
+                f"[yellow]target:[/yellow]{tgt_users} ({len(tgt_in)}p)"
                 f"{lead_str}"
             )
         console.print()
@@ -1124,11 +1185,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_wa.add_argument('--platform', help='Limit to a specific platform')
 
     # ── compare
-    p_compare = sub.add_parser('compare', help='Compare narratives across two platform groups')
-    p_compare.add_argument('--source-group', required=True,
-                           help='Source platform  (e.g. telegram)')
-    p_compare.add_argument('--target-group', required=True,
-                           help='Target platform  (e.g. nitter)')
+    p_compare = sub.add_parser('compare', help='Compare narratives across two groups')
+    p_compare.add_argument('--source-group',
+                           help='Source platform group  (e.g. telegram)')
+    p_compare.add_argument('--target-group',
+                           help='Target platform group  (e.g. nitter)')
+    p_compare.add_argument('--source-accounts',
+                           help='Comma-separated source account usernames  (e.g. PressTV,s_m_marandi)')
+    p_compare.add_argument('--target-accounts',
+                           help='Comma-separated target account usernames  (e.g. TuckerCarlson,joekent16jan19)')
     p_compare.add_argument('--window', default='72h',
                            help='Time window, e.g. 24h, 48h, 7d  (default: 72h)')
 
