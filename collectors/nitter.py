@@ -2,11 +2,17 @@
 Nitter collector — Twitter/X data without the API.
 
 Primary path: rotates through a pool of public Nitter instances.
-Fallback A: Twitter guest-token API (api.twitter.com v1.1 with public bearer).
-Fallback B: Twitter CDN syndication endpoint (cdn.syndication.twimg.com).
+Fallback A: Nitter search endpoint        (from:{username} when timeline returns 0).
+Fallback B: Playwright headless Firefox   (handles JS-challenged instances like nitter.net).
+Fallback C: Twitter guest-token API       (api.twitter.com v1.1 with public bearer).
+Fallback D: Twitter CDN syndication       (cdn.syndication.twimg.com, ~20 tweets).
 
-All three are attempted in order.  If all fail, collect() returns 0 and logs.
+All paths are attempted in order.  If all fail, collect() returns 0 and logs.
 No API key required — uses Twitter's own unauthenticated web-app bearer token.
+Playwright paths only activate when `playwright` + `firefox` binary are installed.
+
+Nitter search also supports pure keyword collection:
+  collect(session, target='', keyword='nato')  → /search?f=tweets&q=nato
 
 Health-checks Nitter on first use; dead instances dropped silently.
 Cap: 500 posts per target per run (configurable).
@@ -25,6 +31,14 @@ import db
 
 logger = logging.getLogger('threadhunt')
 
+# ── Optional Playwright backend ───────────────────────────────────────────────
+try:
+    from collectors import nitter_playwright as _pw
+    _PW_AVAILABLE = _pw.is_available()
+except Exception:
+    _pw = None           # type: ignore[assignment]
+    _PW_AVAILABLE = False
+
 # ── Twitter direct-access constants ──────────────────────────────────────────
 # Public bearer token used by twitter.com's own web app for unauthenticated
 # requests.  Widely documented in open-source scrapers; usable until revoked.
@@ -37,24 +51,65 @@ _TW_TIMELINE_URL   = 'https://api.twitter.com/1.1/statuses/user_timeline.json'
 _TW_SYNDICATION    = 'https://cdn.syndication.twimg.com/timeline/profile'
 
 _live_instances: list | None = None
+_search_instances: list | None = None   # subset of _live_instances that support /search
 
 
 # ── Instance management ───────────────────────────────────────────────────────
 
+_HEALTH_HEADERS = {
+    'User-Agent':      ('Mozilla/5.0 (X11; Linux x86_64; rv:109.0) '
+                        'Gecko/20100101 Firefox/115.0'),
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'DNT':             '1',
+}
+
+# Marker present in Nitter's own HTML but absent from proxy/portal redirect pages
+_NITTER_MARKER = 'nitter'
+# Marker in Nitter search results page (the search form or a timeline entry)
+_SEARCH_MARKER  = 'timeline-item'
+
+
 def health_check_instances(session) -> list:
-    """GET / on each instance with timeout=5. Return only responsive ones."""
-    global _live_instances
+    """
+    GET / on each instance with timeout=5.  Return only responsive ones.
+    Also probes /search?f=tweets&q=test to build the search-capable subset.
+    """
+    global _live_instances, _search_instances
     instances = config.get('nitter_instances', [])
-    live = []
+    live   = []
+    search = []
     for inst in instances:
         try:
-            r = session.get(inst + '/', timeout=5, allow_redirects=True)
-            if r.status_code == 200 and 'nitter' in r.text.lower():
-                live.append(inst)
+            r = session.get(inst + '/', timeout=5, allow_redirects=True,
+                            headers=_HEALTH_HEADERS)
+            if r.status_code != 200 or _NITTER_MARKER not in r.text.lower():
+                continue
+            live.append(inst)
+            # Probe search endpoint — some instances disable it.
+            # A real Nitter search page contains its own search form; a disabled
+            # or redirected instance does not (even if "nitter" appears in URLs).
+            try:
+                sr = session.get(
+                    inst + '/search?f=tweets&q=test',
+                    timeout=5,
+                    allow_redirects=True,
+                    headers=_HEALTH_HEADERS,
+                )
+                if (sr.status_code == 200
+                        and 'name="q"' in sr.text
+                        and 'search-container' in sr.text.lower()):
+                    search.append(inst)
+            except Exception:
+                pass
         except Exception:
             pass
-    _live_instances = live
-    logger.info("Nitter health check: %d/%d instances live", len(live), len(instances))
+    _live_instances   = live
+    _search_instances = search
+    logger.info(
+        "Nitter health check: %d/%d live, %d support search",
+        len(live), len(instances), len(search),
+    )
     return live
 
 
@@ -63,6 +118,13 @@ def _instances(session) -> list:
     if _live_instances is None:
         health_check_instances(session)
     return _live_instances or []
+
+
+def _search_capable_instances(session) -> list:
+    global _search_instances
+    if _search_instances is None:
+        health_check_instances(session)
+    return _search_instances or []
 
 
 def _fetch(session, path: str) -> BeautifulSoup | None:
@@ -77,6 +139,21 @@ def _fetch(session, path: str) -> BeautifulSoup | None:
                 continue  # rate-limited, try next
         except Exception as e:
             logger.debug("Nitter %s error: %s", inst, e)
+    return None
+
+
+def _fetch_search(session, path: str) -> BeautifulSoup | None:
+    """Try search-capable instances only. Return parsed HTML or None."""
+    for inst in _search_capable_instances(session):
+        url = inst + path
+        try:
+            r = session.get(url, timeout=config.get('request_timeout', 10))
+            if r.status_code == 200:
+                return BeautifulSoup(r.text, 'html.parser')
+            if r.status_code == 429:
+                continue
+        except Exception as e:
+            logger.debug("Nitter search %s error: %s", inst, e)
     return None
 
 
@@ -175,6 +252,57 @@ def scrape_timeline(session, username: str, cap: int) -> list:
             break
         path = f'/{username}?cursor={m.group(1)}'
         time.sleep(1.2)   # polite pacing
+
+
+def scrape_search(session, query: str, cap: int) -> list:
+    """
+    Scrape Nitter's /search?f=tweets&q=QUERY page.
+    Only attempts instances confirmed to support search during health check.
+    Works for both user searches (query='from:username') and keyword searches.
+    Paginates via cursor exactly like scrape_timeline.
+    Returns list of {post_id, content, timestamp} dicts (up to cap).
+    """
+    import urllib.parse
+    if not _search_capable_instances(session):
+        logger.debug("Nitter search: no search-capable instances available")
+        return []
+
+    path = f'/search?f=tweets&q={urllib.parse.quote(query)}'
+    posts: list = []
+
+    while len(posts) < cap:
+        soup = _fetch_search(session, path)
+        if not soup:
+            break
+
+        items = soup.select('.timeline-item:not(.show-more)')
+        if not items:
+            break
+
+        page_count = 0
+        for item in items:
+            if len(posts) >= cap:
+                break
+            post = _parse_item(item)
+            if post:
+                posts.append(post)
+                page_count += 1
+
+        if page_count == 0:
+            break
+
+        show_more = soup.select_one('.show-more a')
+        if not show_more or not show_more.get('href'):
+            break
+        href = show_more['href']
+        m = re.search(r'cursor=([^&]+)', href)
+        if not m:
+            break
+        path = f'/search?f=tweets&q={urllib.parse.quote(query)}&cursor={m.group(1)}'
+        time.sleep(1.2)
+
+    logger.info("Nitter search '%s': %d posts", query, len(posts))
+    return posts
 
 
 def _parse_item(item) -> dict | None:
@@ -409,24 +537,47 @@ def _scrape_twitter_syndication(session, username: str, cap: int) -> list:
 
 def collect(session, target: str, keyword: str = None, verbose_cb=None) -> int:
     """
-    Collect posts from a Twitter/X username.
-    Tries three paths in order:
-      1. Nitter instance pool (primary — no rate limits when instances are live)
-      2. Twitter guest-token API via api.twitter.com/1.1 (fallback A)
-      3. Twitter CDN syndication endpoint (fallback B — ~20 tweets, stable)
+    Collect posts from a Twitter/X username (or keyword search when target is empty).
+    Tries paths in order:
+      1. Nitter timeline scrape             (primary — profile timeline)
+      2. Nitter search: from:{username}     (fallback — when timeline returns 0)
+      3. Playwright timeline                (JS browser — handles Cloudflare instances)
+      4. Playwright search: from:{username} (JS browser search fallback)
+      5. Playwright keyword search          (JS browser — keyword-only mode top-up)
+      6. Twitter guest-token API            (direct Twitter v1.1)
+      7. Twitter CDN syndication            (~20 tweets, very stable)
+    Paths 3-5 only run when playwright + firefox binary are installed.
     Returns count of new posts inserted.
     """
     cap = config.get('collector_post_cap', 500)
 
-    # ── Path 1: Nitter ────────────────────────────────────────────────────────
+    # ── Health check ──────────────────────────────────────────────────────────
     if verbose_cb:
         verbose_cb("Checking Nitter instances...")
     health_check_instances(session)
 
     raw_posts = []
     path_used = None
+    profile: dict = {}
 
-    if _instances(session):
+    # ── Keyword-only mode (no username target) ────────────────────────────────
+    if not target and keyword:
+        if _search_capable_instances(session):
+            if verbose_cb:
+                verbose_cb(f"Nitter search: keyword '{keyword}'")
+            raw_posts = scrape_search(session, keyword, cap=cap)
+            if raw_posts:
+                path_used = 'nitter_search_keyword'
+        if not raw_posts:
+            logger.warning("Nitter keyword search: no results for '%s'", keyword)
+            if verbose_cb:
+                verbose_cb(f"Nitter keyword search: no results for '{keyword}'")
+            return 0
+        # Ingest under a synthetic account name for keyword searches
+        target = f'search:{keyword}'
+
+    # ── Path 1: Nitter timeline ───────────────────────────────────────────────
+    if not raw_posts and target and _instances(session):
         if verbose_cb:
             verbose_cb(f"Nitter: {len(_instances(session))} live — scraping @{target}")
         profile = scrape_profile(session, target)
@@ -434,22 +585,60 @@ def collect(session, target: str, keyword: str = None, verbose_cb=None) -> int:
         if raw_posts:
             path_used = 'nitter'
         else:
-            logger.info("Nitter: 0 posts from @%s — trying direct fallback", target)
+            logger.info("Nitter timeline: 0 posts from @%s", target)
             profile = {}
-    else:
-        logger.info("Nitter: 0 live instances — trying direct Twitter fallback")
-        profile = {}
 
-    # ── Path 2: Twitter guest API ─────────────────────────────────────────────
-    if not raw_posts:
+    # ── Path 2: Nitter search from:{username} ────────────────────────────────
+    if not raw_posts and target and not target.startswith('search:') and _search_capable_instances(session):
+        if verbose_cb:
+            verbose_cb(f"Nitter timeline empty — trying search fallback for @{target}")
+        raw_posts = scrape_search(session, f'from:{target}', cap=cap)
+        if raw_posts:
+            path_used = 'nitter_search'
+            logger.info("Nitter search fallback: %d posts for @%s", len(raw_posts), target)
+
+    # ── Path 3: Playwright — timeline (JS-capable browser) ───────────────────
+    # Tries ALL configured instances, including those blocked to plain HTTP.
+    # Only runs when playwright + firefox binary are present.
+    if not raw_posts and target and not target.startswith('search:') and _PW_AVAILABLE:
+        if verbose_cb:
+            verbose_cb(f"Requests paths empty — trying Playwright browser for @{target}")
+        all_instances = config.get('nitter_instances', [])
+        raw_posts = _pw.scrape_timeline_pw(all_instances, target, cap)
+        if raw_posts:
+            path_used = 'nitter_playwright'
+
+    # ── Path 4: Playwright — search from:{username} ───────────────────────────
+    if not raw_posts and target and not target.startswith('search:') and _PW_AVAILABLE:
+        if verbose_cb:
+            verbose_cb(f"Playwright timeline empty — trying Playwright search for @{target}")
+        all_instances = config.get('nitter_instances', [])
+        raw_posts = _pw.scrape_search_pw(all_instances, f'from:{target}', cap)
+        if raw_posts:
+            path_used = 'nitter_playwright_search'
+
+    # ── Path 5: Playwright — keyword search (keyword-only mode top-up) ────────
+    # Keyword-only mode already tried requests-based search above; if that found
+    # nothing and Playwright is available, try again with a real browser.
+    if not raw_posts and not target and keyword and _PW_AVAILABLE:
+        if verbose_cb:
+            verbose_cb(f"Playwright keyword search: '{keyword}'")
+        all_instances = config.get('nitter_instances', [])
+        raw_posts = _pw.scrape_search_pw(all_instances, keyword, cap)
+        if raw_posts:
+            path_used = 'nitter_playwright_keyword'
+            target = f'search:{keyword}'
+
+    # ── Path 6: Twitter guest API ─────────────────────────────────────────────
+    if not raw_posts and target and not target.startswith('search:'):
         if verbose_cb:
             verbose_cb(f"Nitter failed — trying Twitter guest API for @{target}")
         raw_posts = _scrape_twitter_api(session, target, cap)
         if raw_posts:
             path_used = 'twitter_api'
 
-    # ── Path 3: Twitter syndication CDN ──────────────────────────────────────
-    if not raw_posts:
+    # ── Path 7: Twitter syndication CDN ──────────────────────────────────────
+    if not raw_posts and target and not target.startswith('search:'):
         if verbose_cb:
             verbose_cb(f"API failed — trying Twitter syndication for @{target}")
         raw_posts = _scrape_twitter_syndication(session, target, cap)
@@ -458,8 +647,10 @@ def collect(session, target: str, keyword: str = None, verbose_cb=None) -> int:
 
     if not raw_posts:
         logger.warning(
-            "Twitter/X: all paths failed for @%s (Nitter dead, guest API blocked, "
-            "syndication unavailable)", target
+            "Twitter/X: all paths failed for @%s (Nitter dead/blocked, "
+            "Playwright %s, guest API blocked, syndication unavailable)",
+            target,
+            'unavailable' if not _PW_AVAILABLE else 'returned 0',
         )
         if verbose_cb:
             verbose_cb(f"@{target}: all collection paths failed")
