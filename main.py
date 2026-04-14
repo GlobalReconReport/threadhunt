@@ -489,7 +489,8 @@ def cmd_compare(args):
     shared_table.add_column("First in target",                      style="dim")
     shared_table.add_column("Lead time",                            style="magenta")
 
-    coord_signals = 0
+    source_leads = 0
+    target_leads = 0
     for kw, _ in shared_scored[:15]:
         # Find first post containing this keyword in each group
         src_first = next(
@@ -511,9 +512,10 @@ def cmd_compare(args):
                 hours = delta.total_seconds() / 3600
                 if hours > 0:
                     lead_str = f"+{hours:.0f}h (source first)"
-                    coord_signals += 1
+                    source_leads += 1
                 elif hours < 0:
                     lead_str = f"{hours:.0f}h (target first)"
+                    target_leads += 1
                 else:
                     lead_str = "simultaneous"
 
@@ -571,17 +573,41 @@ def cmd_compare(args):
         console.print()
 
     # ── Summary verdict ───────────────────────────────────────────────────────
-    if coord_signals >= 3 or len(cross_clusters) >= 2:
-        verdict = "[bold red]HIGH[/bold red] — source platform consistently leads target. Consistent with narrative seeding pipeline."
-    elif coord_signals >= 1 or cross_clusters:
-        verdict = "[bold yellow]MEDIUM[/bold yellow] — some shared narratives with source leading. Monitor for escalation."
+    directional = source_leads + target_leads   # keywords with a measurable direction
+    if directional == 0:
+        verdict = "[dim]LOW[/dim] — no shared keywords with measurable lead time in this window."
+    elif source_leads > target_leads:
+        if source_leads >= 3 or (directional >= 2 and source_leads / directional >= 0.6):
+            verdict = (
+                "[bold red]HIGH[/bold red] — source leads on "
+                f"{source_leads}/{directional} shared keywords. "
+                "Consistent with narrative seeding pipeline — source leads target."
+            )
+        else:
+            verdict = (
+                "[bold yellow]MEDIUM[/bold yellow] — source leads on "
+                f"{source_leads}/{directional} shared keywords. "
+                "Monitor for escalation."
+            )
+    elif target_leads > source_leads:
+        verdict = (
+            "[bold yellow]INCONCLUSIVE[/bold yellow] — target group posted first on "
+            f"{target_leads}/{directional} shared keywords. "
+            "Collection window may be insufficient for lead-time analysis. "
+            "Expand collection depth before drawing conclusions."
+        )
     else:
-        verdict = "[dim]LOW[/dim] — no clear directional narrative flow in this window."
+        verdict = (
+            "[dim]MIXED[/dim] — mixed lead-time signals "
+            f"(source {source_leads}, target {target_leads}) — "
+            "inconclusive for seeding analysis."
+        )
 
     console.print(Panel(
         f"Shared keywords: [green]{len(shared_kws)}[/green]  "
         f"Cross-group clusters: [green]{len(cross_clusters)}[/green]  "
-        f"Source-leads signals: [magenta]{coord_signals}[/magenta]\n"
+        f"Source-leads: [magenta]{source_leads}[/magenta]  "
+        f"Target-leads: [cyan]{target_leads}[/cyan]\n"
         f"Verdict: {verdict}",
         title="Comparison Summary",
         border_style="dim",
