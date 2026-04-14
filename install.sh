@@ -31,7 +31,7 @@ echo -e "${DIM}─────────────────────�
 echo ""
 
 # ── Step 1: Check Python version ─────────────────────────────────────────────
-echo -e "${CYAN}[1/4]${RESET} Checking Python version..."
+echo -e "${CYAN}[1/5]${RESET} Checking Python version..."
 
 PYTHON_CMD=""
 for cmd in python3.12 python3.11 python3.10 python3; do
@@ -56,7 +56,7 @@ echo -e "${GREEN}  ✓ Found ${PYTHON_CMD} ($VERSION)${RESET}"
 
 # ── Step 2: Virtual environment (optional, recommended) ──────────────────────
 echo ""
-echo -e "${CYAN}[2/4]${RESET} Setting up Python environment..."
+echo -e "${CYAN}[2/5]${RESET} Setting up Python environment..."
 
 USE_VENV=false
 
@@ -93,7 +93,7 @@ fi
 
 # ── Step 3: Install dependencies ─────────────────────────────────────────────
 echo ""
-echo -e "${CYAN}[3/4]${RESET} Installing dependencies..."
+echo -e "${CYAN}[3/5]${RESET} Installing dependencies..."
 
 # Detect if we need --break-system-packages (PEP 668 systems like Kali 2024+)
 INSTALL_FLAGS=""
@@ -113,9 +113,40 @@ $PYTHON_RUN -c "import rich, requests, bs4, langdetect, Levenshtein" 2>/dev/null
     && echo -e "${GREEN}  ✓ All packages installed successfully${RESET}" \
     || { echo -e "${RED}  ✗ Package import check failed — check errors above${RESET}"; exit 1; }
 
-# ── Step 4: Initialize database ──────────────────────────────────────────────
+# ── Step 4: Playwright (optional) ────────────────────────────────────────────
 echo ""
-echo -e "${CYAN}[4/4]${RESET} Initializing database..."
+echo -e "${CYAN}[4/5]${RESET} Optional: Playwright (enhanced Nitter/Twitter collection)"
+echo -e "  ${DIM}Enables headless Firefox to reach JS-protected Nitter instances${RESET}"
+echo -e "  ${DIM}(e.g. nitter.net) that block plain HTTP scrapers.${RESET}"
+echo -e "  ${DIM}Requires ~200 MB for the Firefox browser binary.${RESET}"
+echo ""
+read -r -p "  Install Playwright for enhanced Twitter/Nitter collection? [y/N] " install_pw
+install_pw="${install_pw:-N}"
+if [[ "$install_pw" =~ ^[Yy]$ ]]; then
+    echo ""
+    echo -e "  Installing playwright Python package..."
+    $PIP_CMD install playwright $INSTALL_FLAGS -q 2>&1 | grep -v "^$" | \
+        grep -v "already satisfied" | sed "s/^/  /" || true
+
+    echo -e "  Installing Firefox browser binary..."
+    # Try with sudo if plain install fails (Playwright needs write access to its browser dir)
+    if ! python3 -m playwright install firefox 2>/dev/null; then
+        if command -v sudo &>/dev/null && sudo python3 -m playwright install firefox 2>/dev/null; then
+            echo -e "${GREEN}  ✓ Playwright + Firefox installed (sudo)${RESET}"
+        else
+            echo -e "${YELLOW}  ⚑ Playwright Python package installed but Firefox binary failed.${RESET}"
+            echo -e "${DIM}    Run manually: sudo python3 -m playwright install firefox${RESET}"
+        fi
+    else
+        echo -e "${GREEN}  ✓ Playwright + Firefox installed${RESET}"
+    fi
+else
+    echo -e "  ${DIM}Skipping Playwright — Nitter collection will use requests-based paths only.${RESET}"
+fi
+
+# ── Step 5: Initialize database ──────────────────────────────────────────────
+echo ""
+echo -e "${CYAN}[5/5]${RESET} Initializing database..."
 
 chmod +x main.py
 $PYTHON_RUN main.py db-init 2>&1 | grep -v "banner\|╭\|│\|╰" | sed "s/^/  /" || true

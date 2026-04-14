@@ -37,7 +37,7 @@ THREADHUNT is a lightweight, terminal-only intelligence platform built for analy
 - **Python** 3.10 or higher
 - **OS** Kali Linux recommended; works on any Debian/Ubuntu system
 - **RAM** 2 GB minimum, 4 GB recommended
-- **Storage** ~50 MB for install + whatever your SQLite DB grows to
+- **Storage** ~50 MB for core install + ~200 MB if Playwright/Firefox is enabled
 - **Network** Internet access for collection; Tor supported via SOCKS5
 
 ### Python dependencies (auto-installed)
@@ -51,6 +51,27 @@ python-Levenshtein>=0.20.0
 ```
 
 No pandas. No numpy. No ML frameworks. Designed for minimal resource footprint.
+
+### Optional: Playwright (enhanced Nitter collection)
+
+```bash
+pip install playwright
+playwright install firefox   # downloads ~200 MB Firefox binary
+```
+
+When installed, THREADHUNT automatically uses a headless Firefox browser to reach
+Nitter instances protected by Cloudflare or other JS challenges (e.g. `nitter.net`)
+that return empty bodies to plain HTTP scrapers. The `install.sh` script prompts
+whether to install it during setup.
+
+**What it enables:**
+- Bypasses JS challenges on Cloudflare-protected Nitter instances
+- Search endpoint support (`from:{username}` and keyword queries) on instances
+  that work in a browser but block requests-based scraping
+- Falls back transparently — all existing requests-based paths still run first
+
+**Without Playwright**, Nitter collection uses the requests path + Twitter guest
+API + CDN syndication fallbacks. Most accounts will still be reachable.
 
 ---
 
@@ -492,6 +513,7 @@ threadhunt/
 ├── install.sh
 ├── collectors/
 │   ├── nitter.py                # Twitter/X via public Nitter instances
+│   ├── nitter_playwright.py     # Optional: headless Firefox for JS-protected instances
 │   ├── fourchan.py              # 4chan JSON API (/pol/, /k/, /int/)
 │   ├── telegram.py              # Telegram public channels (t.me/s/)
 │   ├── vk.py                    # VK public walls
@@ -523,7 +545,7 @@ threadhunt/
 
 | Collector | Notes |
 |---|---|
-| **Nitter** | Health-checks 8 public instances on startup. Rotates automatically on failure. Paginates via cursor. |
+| **Nitter** | Health-checks 8 public instances on startup. Rotates automatically on failure. Paginates via cursor. Falls back through: requests timeline → requests search (`from:`) → Playwright timeline → Playwright search → Twitter guest API → Twitter CDN syndication. Playwright paths activate automatically if installed. |
 | **4chan** | Uses the official free JSON API. Polls catalog, matches threads against watchlist, archives matching threads in full. |
 | **Telegram** | Scrapes `t.me/s/{channel}` public preview. No Telethon, no API key. Limited to publicly visible messages. |
 | **VK** | Scrapes initial server-side HTML render (~15–30 posts visible without JS). Deep historical collection requires the VK API. |
