@@ -1,0 +1,5 @@
+cd ~/threadhunt
+source .venv/bin/activate
+python main.py collect --platform nitter
+python main.py analyze
+python main.py report
