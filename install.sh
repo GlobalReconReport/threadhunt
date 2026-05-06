@@ -113,35 +113,33 @@ $PYTHON_RUN -c "import rich, requests, bs4, langdetect, Levenshtein" 2>/dev/null
     && echo -e "${GREEN}  ✓ All packages installed successfully${RESET}" \
     || { echo -e "${RED}  ✗ Package import check failed — check errors above${RESET}"; exit 1; }
 
-# ── Step 4: Playwright (optional) ────────────────────────────────────────────
+# ── Step 4: Playwright (auto-install) ────────────────────────────────────────
 echo ""
-echo -e "${CYAN}[4/5]${RESET} Optional: Playwright (enhanced Nitter/Twitter collection)"
-echo -e "  ${DIM}Enables headless Firefox to reach JS-protected Nitter instances${RESET}"
-echo -e "  ${DIM}(e.g. nitter.net) that block plain HTTP scrapers.${RESET}"
+echo -e "${CYAN}[4/5]${RESET} Installing Playwright (Nitter/Twitter JS-protected fallback)..."
+echo -e "  ${DIM}Headless Firefox reaches Cloudflare-fronted instances (e.g. nitter.net).${RESET}"
 echo -e "  ${DIM}Requires ~200 MB for the Firefox browser binary.${RESET}"
-echo ""
-read -r -p "  Install Playwright for enhanced Twitter/Nitter collection? [y/N] " install_pw
-install_pw="${install_pw:-N}"
-if [[ "$install_pw" =~ ^[Yy]$ ]]; then
-    echo ""
+
+# Skip the pip install if playwright is already importable.
+if $PYTHON_RUN -c "import playwright" 2>/dev/null; then
+    echo -e "${GREEN}  ✓ Playwright Python package already installed${RESET}"
+else
     echo -e "  Installing playwright Python package..."
     $PIP_CMD install playwright $INSTALL_FLAGS -q 2>&1 | grep -v "^$" | \
         grep -v "already satisfied" | sed "s/^/  /" || true
+fi
 
-    echo -e "  Installing Firefox browser binary..."
-    # Try with sudo if plain install fails (Playwright needs write access to its browser dir)
-    if ! python3 -m playwright install firefox 2>/dev/null; then
-        if command -v sudo &>/dev/null && sudo python3 -m playwright install firefox 2>/dev/null; then
-            echo -e "${GREEN}  ✓ Playwright + Firefox installed (sudo)${RESET}"
-        else
-            echo -e "${YELLOW}  ⚑ Playwright Python package installed but Firefox binary failed.${RESET}"
-            echo -e "${DIM}    Run manually: sudo python3 -m playwright install firefox${RESET}"
-        fi
+echo -e "  Installing Firefox browser binary..."
+# Try with sudo if plain install fails (Playwright needs write access to its browser dir).
+# `playwright install firefox` is itself idempotent — re-running it is a no-op when present.
+if ! $PYTHON_RUN -m playwright install firefox 2>/dev/null; then
+    if command -v sudo &>/dev/null && sudo $PYTHON_RUN -m playwright install firefox 2>/dev/null; then
+        echo -e "${GREEN}  ✓ Playwright + Firefox installed (sudo)${RESET}"
     else
-        echo -e "${GREEN}  ✓ Playwright + Firefox installed${RESET}"
+        echo -e "${YELLOW}  ⚑ Playwright Python package installed but Firefox binary failed.${RESET}"
+        echo -e "${DIM}    Run manually: sudo $PYTHON_RUN -m playwright install firefox${RESET}"
     fi
 else
-    echo -e "  ${DIM}Skipping Playwright — Nitter collection will use requests-based paths only.${RESET}"
+    echo -e "${GREEN}  ✓ Playwright + Firefox installed${RESET}"
 fi
 
 # ── Step 5: Initialize database ──────────────────────────────────────────────
