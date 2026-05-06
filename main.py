@@ -159,6 +159,14 @@ def cmd_collect(args):
             console.print("[yellow]No youtube_channels configured. Use --target or set youtube_channels in config.[/yellow]")
             return
         console.print(f"[dim]Collecting from {len(targets)} configured YouTube channels[/dim]")
+    elif platform == 'nitter':
+        with db.get_conn() as conn:
+            rows = db.list_tracked_accounts(conn, platform='nitter', active_only=True)
+        targets = [row['username'] for row in rows]
+        if not targets:
+            console.print("[yellow]No active tracked_accounts. Use --target or `account-add <username>`.[/yellow]")
+            return
+        console.print(f"[dim]Collecting from {len(targets)} active tracked_accounts[/dim]")
     else:
         console.print(f"[red]--target required for platform: {platform}[/red]")
         return
@@ -1083,6 +1091,64 @@ def cmd_watch_add(args):
     console.print(f"[green]Watchlist:[/green] added [{item_type}] {value}")
 
 
+# ── account-add / account-list / account-remove ──────────────────────────────
+
+def cmd_account_add(args):
+    platform = (getattr(args, 'platform', None) or 'nitter').lower()
+    notes    = getattr(args, 'notes', None)
+    with db.get_conn() as conn:
+        try:
+            db.add_tracked_account(conn, args.username, platform=platform, notes=notes)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+    uname = args.username.lstrip('@')
+    console.print(f"[green]Tracked:[/green] @{escape(uname)} [dim]({platform})[/dim]")
+
+
+def cmd_account_list(args):
+    platform = getattr(args, 'platform', None)
+    with db.get_conn() as conn:
+        rows = db.list_tracked_accounts(conn, platform=platform, active_only=False)
+
+    if not rows:
+        console.print("[dim]No tracked accounts.[/dim]")
+        return
+
+    t = Table(title="Tracked Accounts", show_header=True, header_style="bold",
+              border_style="dim")
+    t.add_column("ID",       style="dim",  width=5)
+    t.add_column("Username", style="white", min_width=24, no_wrap=True, overflow="fold")
+    t.add_column("Platform", style="cyan", width=10)
+    t.add_column("Active",   width=8)
+    t.add_column("Added",    style="dim",  width=20)
+    t.add_column("Notes")
+
+    for row in rows:
+        active_str = "[green]✓[/green]" if row['active'] else "[dim]·[/dim]"
+        t.add_row(
+            str(row['id']),
+            escape(row['username'] or ''),
+            escape(row['platform'] or ''),
+            active_str,
+            (row['added_at'] or '')[:19],
+            escape(row['notes'] or ''),
+        )
+    console.print(t)
+    console.print(f"[dim]{len(rows)} total ({sum(1 for r in rows if r['active'])} active)[/dim]")
+
+
+def cmd_account_remove(args):
+    platform = (getattr(args, 'platform', None) or 'nitter').lower()
+    with db.get_conn() as conn:
+        ok = db.remove_tracked_account(conn, args.username, platform=platform)
+    uname = args.username.lstrip('@')
+    if ok:
+        console.print(f"[yellow]Deactivated:[/yellow] @{escape(uname)} [dim]({platform})[/dim]")
+    else:
+        console.print(f"[dim]No tracked account @{escape(uname)} on {platform}.[/dim]")
+
+
 # ── export-state ──────────────────────────────────────────────────────────────
 
 def cmd_export_state(args):
@@ -1101,12 +1167,23 @@ def cmd_export_state(args):
             if fpath.exists():
                 tar.add(str(fpath), arcname=fname)
 
+    # Tally tracked_accounts so the operator sees the roster size landed in the archive.
+    tracked_count = 0
+    try:
+        with db.get_conn() as conn:
+            tracked_count = conn.execute(
+                "SELECT COUNT(*) FROM tracked_accounts WHERE active=1"
+            ).fetchone()[0]
+    except Exception:
+        pass
+
     size_mb = out_path.stat().st_size / 1024 / 1024
     console.print(
         f"[green]State exported:[/green] {out_path}  "
         f"[dim]({size_mb:.1f} MB)[/dim]"
     )
-    logger.info("State exported to %s", out_path)
+    console.print(f"[dim]Tracked accounts (active): {tracked_count}[/dim]")
+    logger.info("State exported to %s (tracked_accounts=%d)", out_path, tracked_count)
 
 
 # ── import-state ──────────────────────────────────────────────────────────────
@@ -1139,6 +1216,17 @@ def cmd_import_state(args):
     cfg._config = None
     cfg.load_config()
 
+    # Tracked-accounts roster came over with the DB — surface its size.
+    tracked_count = 0
+    try:
+        with db.get_conn() as conn:
+            tracked_count = conn.execute(
+                "SELECT COUNT(*) FROM tracked_accounts WHERE active=1"
+            ).fetchone()[0]
+    except Exception:
+        pass
+    console.print(f"[dim]Tracked accounts (active): {tracked_count}[/dim]")
+
     # Show quick status
     cmd_status(args)
 
@@ -1165,8 +1253,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_collect = sub.add_parser('collect', help='Collect posts from a platform')
     p_collect.add_argument('--platform', required=True,
                            help='nitter | twitter | 4chan | telegram | vk | web | youtube')
-    p_collect.add_argument('--target',   required=True,
-                           help='Username, board, channel, or URL')
+    p_collect.add_argument('--target',   required=False, default=None,
+                           help='Username, board, channel, or URL '
+                                '(optional for nitter — falls back to tracked_accounts)')
     p_collect.add_argument('--keyword',  help='Filter to posts containing this keyword')
     p_collect.add_argument('--verbose',  action='store_true')
 
@@ -1223,6 +1312,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_compare.add_argument('--window', default='72h',
                            help='Time window, e.g. 24h, 48h, 7d  (default: 72h)')
 
+    # ── account-add / account-list / account-remove
+    p_aa = sub.add_parser('account-add', help='Add a username to tracked_accounts')
+    p_aa.add_argument('username',     help='Username (leading @ stripped automatically)')
+    p_aa.add_argument('--platform',   default='nitter',
+                      help='Platform (default: nitter)')
+    p_aa.add_argument('--notes',      help='Optional notes')
+
+    p_al = sub.add_parser('account-list', help='List tracked_accounts')
+    p_al.add_argument('--platform',   help='Filter by platform')
+
+    p_ar = sub.add_parser('account-remove', help='Soft-delete (deactivate) a tracked account')
+    p_ar.add_argument('username',     help='Username to deactivate')
+    p_ar.add_argument('--platform',   default='nitter',
+                      help='Platform (default: nitter)')
+
     # ── export-state
     sub.add_parser('export-state', help='Export DB + config to tar.gz')
 
@@ -1243,9 +1347,12 @@ COMMAND_MAP = {
     'status':       cmd_status,
     'watch':        cmd_watch,
     'watch-add':    cmd_watch_add,
-    'compare':      cmd_compare,
-    'export-state': cmd_export_state,
-    'import-state': cmd_import_state,
+    'compare':         cmd_compare,
+    'account-add':     cmd_account_add,
+    'account-list':    cmd_account_list,
+    'account-remove':  cmd_account_remove,
+    'export-state':    cmd_export_state,
+    'import-state':    cmd_import_state,
 }
 
 

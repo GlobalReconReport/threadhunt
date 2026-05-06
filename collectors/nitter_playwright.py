@@ -18,10 +18,12 @@ Exported API:
   is_available() -> bool
   scrape_timeline_pw(instances, username, cap) -> list[dict]
   scrape_search_pw(instances, query, cap)     -> list[dict]
+  scrape_profile_pw(instances, username)      -> dict
 
 Each returned dict: {post_id, content, timestamp}  (same shape as nitter.py)
 """
 import re
+import hashlib
 import logging
 import urllib.parse
 from datetime import datetime, timezone
@@ -352,3 +354,97 @@ def scrape_search_pw(instances: list, query: str, cap: int) -> list:
                 pass
 
     return []
+
+
+# ── Profile scraping (fallback for JS-protected instances) ───────────────────
+
+def _parse_stat_html(soup, href_suffix: str) -> int:
+    """
+    Extract a stat number from a Nitter profile.  Mirrors nitter._parse_stat
+    so JS-rendered pages get the same dual-variant handling.
+    """
+    cls = href_suffix.lstrip('/')
+    # Variant A — anchor-based.
+    for a in soup.select('.profile-statlist a'):
+        if a.get('href', '').endswith(href_suffix):
+            num_el = a.select_one('.profile-stat-num')
+            if num_el:
+                try:
+                    return int(num_el.get_text(strip=True).replace(',', ''))
+                except ValueError:
+                    pass
+    # Variant B — list-item-class-based (nitter.net).
+    li_num = soup.select_one(f'.profile-statlist li.{cls} .profile-stat-num')
+    if li_num:
+        try:
+            return int(li_num.get_text(strip=True).replace(',', ''))
+        except ValueError:
+            pass
+    return 0
+
+
+def scrape_profile_pw(instances: list, username: str) -> dict:
+    """
+    Scrape a user's Nitter profile using a headless Firefox browser.
+    Fallback path for instances that block plain HTTP requests with a JS
+    challenge.  Returns a dict shaped like nitter.scrape_profile():
+        {username, bio, followers, following, profile_pic_hash}
+    Empty dict if every instance fails.
+    """
+    browser = _get_browser()
+    if not browser:
+        return {}
+
+    from bs4 import BeautifulSoup
+
+    for inst in instances:
+        url = inst + f'/{username}'
+        logger.debug("Playwright profile: trying %s", url)
+
+        page, html = _open_page(browser, url)
+        if not page:
+            continue
+
+        try:
+            html = page.content()
+            if not _html_is_nitter(html):
+                logger.debug("Playwright: %s did not serve Nitter HTML", inst)
+                continue
+
+            soup = BeautifulSoup(html, 'html.parser')
+            profile: dict = {'username': username}
+
+            bio_el = soup.select_one('.profile-bio p') or soup.select_one('.profile-bio')
+            profile['bio'] = bio_el.get_text(strip=True) if bio_el else ''
+
+            profile['followers'] = _parse_stat_html(soup, '/followers')
+            profile['following'] = _parse_stat_html(soup, '/following')
+
+            # Profile pic — fetch via the same browser context so it inherits
+            # cookies/challenge state from the navigation we just did.
+            pic_el = soup.select_one('.profile-card-avatar img')
+            if pic_el and pic_el.get('src'):
+                pic_src = pic_el['src']
+                if pic_src.startswith('/'):
+                    pic_src = inst + pic_src
+                try:
+                    resp = page.context.request.get(pic_src, timeout=10_000)
+                    if resp.ok:
+                        profile['profile_pic_hash'] = hashlib.md5(resp.body()).hexdigest()
+                except Exception as e:
+                    logger.debug("Playwright profile pic fetch error: %s", e)
+
+            logger.info(
+                "Playwright profile: scraped @%s via %s "
+                "(followers=%d following=%d)",
+                username, inst,
+                profile.get('followers', 0), profile.get('following', 0),
+            )
+            return profile
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    return {}

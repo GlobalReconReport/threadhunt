@@ -198,7 +198,15 @@ def scrape_profile(session, username: str) -> dict:
 
 
 def _parse_stat(soup, href_suffix: str) -> int:
-    """Extract a stat number from a Nitter profile-statlist link."""
+    """Extract a stat number from a Nitter profile.
+
+    Two markup variants exist in the wild:
+      A) <li><a href=".../followers"><span class="profile-stat-num">N</span></a></li>
+      B) <li class="followers"><span class="profile-stat-num">N</span></li>   (nitter.net)
+    Variant B has no anchor, so the original implementation always returned 0
+    against nitter.net and left followers/following at 0 in the DB.
+    """
+    # Variant A — anchor-based.
     for a in soup.select('.profile-statlist a'):
         if a.get('href', '').endswith(href_suffix):
             num_el = a.select_one('.profile-stat-num')
@@ -207,6 +215,15 @@ def _parse_stat(soup, href_suffix: str) -> int:
                     return int(num_el.get_text(strip=True).replace(',', ''))
                 except ValueError:
                     pass
+
+    # Variant B — list-item-class-based.
+    cls = href_suffix.lstrip('/')
+    li_num = soup.select_one(f'.profile-statlist li.{cls} .profile-stat-num')
+    if li_num:
+        try:
+            return int(li_num.get_text(strip=True).replace(',', ''))
+        except ValueError:
+            pass
     return 0
 
 

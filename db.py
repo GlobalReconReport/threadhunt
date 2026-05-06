@@ -161,6 +161,17 @@ def init_db():
             platform         TEXT
         );
 
+        -- ── Tracked accounts (collection roster) ─────────────────────────────
+        CREATE TABLE IF NOT EXISTS tracked_accounts (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            username  TEXT    NOT NULL,
+            platform  TEXT    NOT NULL DEFAULT 'nitter',
+            added_at  TEXT,
+            notes     TEXT,
+            active    INTEGER DEFAULT 1,
+            UNIQUE(username, platform)
+        );
+
         -- ── Indexes ───────────────────────────────────────────────────────────
         CREATE INDEX IF NOT EXISTS idx_posts_simhash    ON posts(simhash);
         CREATE INDEX IF NOT EXISTS idx_posts_timestamp  ON posts(timestamp);
@@ -195,7 +206,28 @@ def init_db():
         except Exception:
             pass  # index already exists
 
+        # Seed default tracked_accounts roster on first init only.
+        existing = conn.execute("SELECT COUNT(*) FROM tracked_accounts").fetchone()[0]
+        if existing == 0:
+            now = datetime.now(timezone.utc).isoformat()
+            conn.executemany(
+                "INSERT INTO tracked_accounts (username, platform, added_at, active) "
+                "VALUES (?, 'nitter', ?, 1)",
+                [(u, now) for u in _DEFAULT_TRACKED_ACCOUNTS],
+            )
+            logger.info("Seeded %d default tracked_accounts", len(_DEFAULT_TRACKED_ACCOUNTS))
+
     logger.info("DB initialized: %s", _get_db_path())
+
+
+# Default roster — seeded into tracked_accounts on first db-init.
+_DEFAULT_TRACKED_ACCOUNTS = [
+    'TuckerCarlson', 'RealCandaceO', 'joekent16jan19', 'AGDugin', 'ProfessorJiang_',
+    'sneako', 'jacksonhinklle', 'clashreport', 'ExplosiveMediaa', 'its_The_Dr',
+    'DD_Geopolitics', 'richimedhurst', 'MyLordBebo', 'cenkuygur', 'mehdirhasan',
+    'AdameMedia', 'AbbyMartin', 'OANN', 'MattGaetz', 'Bannons_WarRoom',
+    'mb_ghalibaf', 'TCNetwork', 'ryangrim', 'DropSiteNews', 'DougAMacgregor',
+]
 
 
 # ── Stream helpers ────────────────────────────────────────────────────────────
@@ -319,3 +351,71 @@ def end_session(conn, session_id: int, posts_collected: int, alerts_triggered: i
         SET ended_at=?, posts_collected=?, alerts_triggered=?
         WHERE id=?
     """, (now, posts_collected, alerts_triggered, session_id))
+
+
+# ── tracked_accounts helpers ──────────────────────────────────────────────────
+
+def add_tracked_account(conn, username: str, platform: str = 'nitter',
+                        notes: str = None) -> int:
+    """
+    Insert a tracked account, or reactivate it if soft-deleted.
+    Strips a leading '@' from username automatically.
+    Returns the account row id.
+    """
+    username = (username or '').lstrip('@').strip()
+    if not username:
+        raise ValueError("username is required")
+
+    now = datetime.now(timezone.utc).isoformat()
+    existing = conn.execute(
+        "SELECT id, active FROM tracked_accounts WHERE username=? AND platform=?",
+        (username, platform),
+    ).fetchone()
+
+    if existing:
+        # Reactivate and update notes if provided.
+        if notes is not None:
+            conn.execute(
+                "UPDATE tracked_accounts SET active=1, notes=? WHERE id=?",
+                (notes, existing['id']),
+            )
+        else:
+            conn.execute(
+                "UPDATE tracked_accounts SET active=1 WHERE id=?",
+                (existing['id'],),
+            )
+        return int(existing['id'])
+
+    cursor = conn.execute(
+        "INSERT INTO tracked_accounts (username, platform, added_at, notes, active) "
+        "VALUES (?, ?, ?, ?, 1)",
+        (username, platform, now, notes),
+    )
+    return cursor.lastrowid
+
+
+def list_tracked_accounts(conn, platform: str = None, active_only: bool = True) -> list:
+    """Return tracked_accounts rows as a list of sqlite3.Row objects."""
+    where = []
+    params: list = []
+    if active_only:
+        where.append("active=1")
+    if platform:
+        where.append("platform=?")
+        params.append(platform)
+    where_str = ' AND '.join(where) if where else '1=1'
+    return conn.execute(
+        f"SELECT id, username, platform, added_at, notes, active "
+        f"FROM tracked_accounts WHERE {where_str} ORDER BY username COLLATE NOCASE",
+        tuple(params),
+    ).fetchall()
+
+
+def remove_tracked_account(conn, username: str, platform: str = 'nitter') -> bool:
+    """Soft-delete (active=0). Returns True if a row was updated."""
+    username = (username or '').lstrip('@').strip()
+    cursor = conn.execute(
+        "UPDATE tracked_accounts SET active=0 WHERE username=? AND platform=?",
+        (username, platform),
+    )
+    return cursor.rowcount > 0
