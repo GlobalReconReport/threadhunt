@@ -298,10 +298,25 @@ def cmd_analyze(args):
                         description=f"[green]Alerts — {new_alerts} new triggered",
                         total=1, completed=1)
 
+        # Step 7: Cross-engine campaign dedup.
+        # campaign_engine and narrative_clustering each insert campaign rows;
+        # they can produce duplicates that point at the same post set under
+        # different inferred keywords or different cluster_keys.  Run the
+        # dedup AFTER both engines so duplicates from either are collapsed.
+        task_dedup = progress.add_task(
+            "[cyan]Deduplicating overlapping campaigns...", total=None
+        )
+        from analysis.campaign_engine import dedupe_overlapping_campaigns
+        deduped = dedupe_overlapping_campaigns(min_overlap=0.8)
+        progress.update(task_dedup,
+                        description=f"[green]Dedup — {deduped} duplicate campaigns deactivated",
+                        total=1, completed=1)
+
     console.print(f"\n[green]Analysis complete.[/green]")
     console.print(f"  Flagged bots:        [red]{flagged}[/red]")
     console.print(f"  SimHash campaigns:   [yellow]{new_campaigns}[/yellow]")
     console.print(f"  Narrative clusters:  [yellow]{narrative_clusters}[/yellow]")
+    console.print(f"  Duplicate campaigns deactivated: [magenta]{deduped}[/magenta]")
     console.print(f"  Temporal profiled:   [cyan]{temporal_count}[/cyan]")
     console.print(f"  Identity links:      [cyan]{id_links}[/cyan]  Time-correlated: [cyan]{id_corr}[/cyan]")
     console.print(f"  New alerts:          [red]{new_alerts}[/red]")
@@ -735,7 +750,6 @@ def cmd_report(args):
 
 def _print_tree_report(platform, keyword, time_window):
     from analysis.campaign_engine import get_active_campaigns, get_campaign_posts
-    from analysis.narrative_clustering import extract_keywords as _nc_kws
 
     with db.get_conn() as conn:
         campaigns = get_active_campaigns(conn)
@@ -746,64 +760,116 @@ def _print_tree_report(platform, keyword, time_window):
 
         root = Tree("[bold]Active Campaigns[/bold]")
 
-        shown = 0
         for camp in campaigns[:20]:
             if platform and camp.get('platform') != platform:
                 continue
             if keyword and keyword.lower() not in (camp.get('keyword') or '').lower():
                 continue
 
-            conf = camp.get('confidence_score', 0)
-            conf_color = 'red' if conf >= 0.7 else ('yellow' if conf >= 0.4 else 'green')
-            camp_label = (
-                f"[{conf_color}]Campaign #{camp['id']}[/{conf_color}] "
-                f"[cyan]{escape(camp['platform'] or '')}[/cyan] "
-                f"kw=[white]{escape(camp['keyword'] or '')}[/white] "
-                f"conf=[{conf_color}]{conf:.2f}[/{conf_color}] "
-                f"accts=[bold]{camp['account_count']}[/bold]"
-            )
-            camp_node = root.add(camp_label)
+            # NOTE: get_campaign_posts already filters by campaign_id via the
+            # clusters table JOIN, so every post returned here is genuinely
+            # part of THIS campaign.  The earlier keyword-content filter was
+            # redundant and dropped amplifiers whose post used a synonym for
+            # the inferred keyword (e.g. "Strait of Hormuz" missing on kw=hormuz
+            # because tokenization happened to drop it).  Removed.
+            posts = get_campaign_posts(camp['id'], conn, limit=200)
 
-            posts = get_campaign_posts(camp['id'], conn, limit=50)
-            # Filter to posts that actually contain the campaign keyword —
-            # get_campaign_posts returns all posts in the cluster, but multiple
-            # clusters can share the same campaign, so without filtering every
-            # campaign displays the same set of cluster posts.
-            camp_kw = (camp.get('keyword') or '').lower()
-            if camp_kw:
-                # Check raw content text (English) OR extracted keywords
-                # (handles Cyrillic-normalized terms: "iran" won't appear
-                # verbatim in Russian text but will be in the keyword set).
-                def _post_has_kw(p, kw=camp_kw):
-                    content = (p.get('content') or '').lower()
-                    return kw in content or kw in _nc_kws(content)
-                posts = [p for p in posts if _post_has_kw(p)]
-            posts = posts[:10]
-            if not posts:
-                camp_node.add("[dim]no posts[/dim]")
-                continue
-
-            # Group posts by account
+            # Group posts by account so the tree shows per-account context.
             by_account: dict = {}
             for p in posts:
                 uname = p.get('username', 'unknown')
                 by_account.setdefault(uname, []).append(p)
 
-            for uname, uposts in list(by_account.items())[:5]:
-                bscore = uposts[0].get('bot_score', 0.0) if uposts else 0.0
-                acct_node = camp_node.add(
-                    f"[white]@{escape(uname)}[/white] {bot_score_bar(bscore)}"
+            # Sort accounts by their FIRST post timestamp ascending — seeder
+            # on top, amplifiers below.  This is the propagation order that
+            # makes coordinated narrative pushes legible at a glance.
+            def _account_first_ts(uposts):
+                return min((p.get('timestamp') or '9999') for p in uposts)
+            ordered_accounts = sorted(
+                by_account.items(), key=lambda kv: _account_first_ts(kv[1])
+            )
+
+            # Compute campaign-wide temporal spread: window, seeder, last poster.
+            all_ts = sorted([p.get('timestamp') for p in posts if p.get('timestamp')])
+            window_str  = ''
+            arc_str     = ''
+            seeder_user = None
+            if all_ts:
+                first_dt = _parse_ts_cmp(all_ts[0])
+                last_dt  = _parse_ts_cmp(all_ts[-1])
+                if first_dt and last_dt:
+                    window_str = _fmt_window(last_dt - first_dt)
+                # Seeder = account whose earliest post is the campaign's earliest post.
+                if ordered_accounts:
+                    seeder_user = ordered_accounts[0][0]
+                    last_user   = ordered_accounts[-1][0]
+                    arc_str = (
+                        f"arc: [magenta]@{escape(seeder_user)}[/magenta] "
+                        f"[dim]{(all_ts[0] or '')[:16]}[/dim] → "
+                        f"[cyan]@{escape(last_user)}[/cyan] "
+                        f"[dim]{(all_ts[-1] or '')[:16]}[/dim]"
+                    )
+
+            # Build the campaign label (now includes window).
+            conf = camp.get('confidence_score', 0)
+            conf_color = 'red' if conf >= 0.7 else ('yellow' if conf >= 0.4 else 'green')
+            # Use the *actual* unique account count from the post set — handles
+            # the case where campaigns.account_count rolled back during dedup.
+            actual_accts = len(by_account) if by_account else camp.get('account_count', 0)
+            camp_label = (
+                f"[{conf_color}]Campaign #{camp['id']}[/{conf_color}] "
+                f"[cyan]{escape(camp['platform'] or '')}[/cyan] "
+                f"kw=[white]{escape(camp['keyword'] or '')}[/white] "
+                f"conf=[{conf_color}]{conf:.2f}[/{conf_color}] "
+                f"accts=[bold]{actual_accts}[/bold]"
+            )
+            if window_str:
+                camp_label += f" window=[magenta]{window_str}[/magenta]"
+            camp_node = root.add(camp_label)
+
+            if arc_str:
+                camp_node.add(arc_str)
+
+            if not posts:
+                camp_node.add("[dim]no posts[/dim]")
+                continue
+
+            for uname, uposts in ordered_accounts[:8]:
+                # Show first-post timestamp + count per account, with a
+                # [seeder] tag on the earliest poster — the propagation-order
+                # context is what matters for amplification-node analysis.
+                u_first    = _account_first_ts(uposts)[:16]
+                seeder_tag = " [bold magenta]\\[seeder][/bold magenta]" if uname == seeder_user else ""
+                acct_node  = camp_node.add(
+                    f"[white]@{escape(uname)}[/white]{seeder_tag} "
+                    f"[dim]first {u_first} · {len(uposts)} post"
+                    f"{'s' if len(uposts) != 1 else ''}[/dim]"
                 )
-                for p in uposts[:3]:
+                # Posts shown in chronological order so reading top-to-bottom
+                # tracks the account's contribution timeline.
+                for p in sorted(uposts, key=lambda x: x.get('timestamp') or '')[:3]:
                     content_preview = (p.get('content') or '')[:80].replace('\n', ' ')
                     acct_node.add(
                         f"[dim]{escape(p.get('timestamp', '')[:16])}[/dim] "
                         f"{escape(content_preview)}…"
                     )
 
-            shown += 1
-
         console.print(root)
+
+
+def _fmt_window(td) -> str:
+    """Format a timedelta as a compact 'XhYm' / 'Ym' / 'Xd Yh' string."""
+    total = int(td.total_seconds())
+    if total < 60:
+        return f"{total}s"
+    minutes, _ = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    days,  hours   = divmod(hours, 24)
+    if days:
+        return f"{days}d{hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h{minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
 
 
 # ── status ────────────────────────────────────────────────────────────────────

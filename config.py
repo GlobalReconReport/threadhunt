@@ -16,7 +16,12 @@ DEFAULT_CONFIG = {
     'bot_score_threshold':          0.7,
     'campaign_min_accounts':        3,
     'campaign_time_window_minutes': 30,
-    'campaign_simhash_distance':    5,
+    # 8 = standard "near-duplicate document" threshold in published SimHash
+    # literature.  5 was set for tight copy-paste detection but starves the
+    # cluster engine of paraphrased real-account content (news commentators
+    # rephrase rather than copy-paste, producing 10-15 bit divergence on
+    # topically-identical posts).
+    'campaign_simhash_distance':    8,
 
     # Narrative clustering (semantic coordination detection)
     'narrative_time_window_hours':   6,    # time window for clustering

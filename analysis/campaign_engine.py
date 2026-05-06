@@ -25,6 +25,7 @@ def run(progress_cb=None) -> int:
     fourchan_time_window = config.get('fourchan_campaign_time_window_minutes', 1440)
     min_accounts        = config.get('campaign_min_accounts', 3)
     max_dist            = config.get('campaign_simhash_distance', 5)
+    dedup_overlap       = config.get('campaign_dedup_overlap', 0.8)
 
     new_campaigns = 0
 
@@ -52,8 +53,163 @@ def run(progress_cb=None) -> int:
         cross = _detect_cross_platform(conn, max_dist + 5)
     new_campaigns += cross
 
-    logger.info("Campaign engine: %d new campaigns detected", new_campaigns)
+    # Cleanup pass: deactivate duplicate campaigns produced by earlier runs
+    # (different cluster_keys can land on the same posts when the greedy
+    # clusterer's representative-post changes between runs — e.g. a fresh
+    # collection inserts a new "first" post into the window).
+    deduped = _dedupe_overlapping_campaigns(min_overlap=dedup_overlap)
+
+    logger.info(
+        "Campaign engine: %d new campaigns detected, %d duplicates deactivated",
+        new_campaigns, deduped
+    )
     return new_campaigns
+
+
+# ── Campaign deduplication ───────────────────────────────────────────────────
+
+def dedupe_overlapping_campaigns(min_overlap: float = 0.8) -> int:
+    """Public alias — see _dedupe_overlapping_campaigns. Exposed so the analyze
+    pipeline can run a final dedup after all campaign-creating modules
+    (campaign_engine + narrative_clustering) have completed."""
+    return _dedupe_overlapping_campaigns(min_overlap=min_overlap)
+
+
+def _find_overlapping_campaign(post_ids: list, platform: str,
+                               threshold: float = 0.8) -> int | None:
+    """
+    Return the id of an active campaign whose post set overlaps the given
+    post_ids by ≥ threshold (denominator = min of the two sizes — Szymkiewicz–
+    Simpson coefficient, robust against one set being much larger than the
+    other).  Used as a preventive check before _save_campaign so we don't
+    create a fresh campaign row when an existing one already covers the cluster.
+    Returns None if no candidate clears the threshold.
+    """
+    if not post_ids:
+        return None
+    placeholders = ','.join('?' * len(post_ids))
+    with db.get_conn() as conn:
+        rows = conn.execute(f"""
+            SELECT cl.campaign_id, COUNT(*) AS shared
+            FROM clusters cl
+            JOIN campaigns c ON c.id = cl.campaign_id
+            WHERE cl.post_id IN ({placeholders})
+              AND c.platform = ?
+              AND c.active   = 1
+            GROUP BY cl.campaign_id
+            ORDER BY shared DESC
+        """, (*post_ids, platform)).fetchall()
+
+        for cid, shared in rows:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM clusters WHERE campaign_id=?", (cid,)
+            ).fetchone()[0]
+            denom = min(total, len(post_ids))
+            if denom > 0 and shared / denom >= threshold:
+                return cid
+    return None
+
+
+def _link_posts_to_campaign(campaign_id: int, cluster: list,
+                            unique_accounts: set) -> None:
+    """
+    Attach a freshly-detected cluster to an existing campaign without creating
+    a new campaign row.  Re-uses the existing campaign's cluster_key so the
+    clusters table stays internally consistent.  Recomputes post_count and
+    account_count from the union to handle growth from the merge.
+    """
+    with db.get_conn() as conn:
+        key_row = conn.execute(
+            "SELECT cluster_key FROM clusters WHERE campaign_id=? LIMIT 1",
+            (campaign_id,)
+        ).fetchone()
+        key = key_row[0] if key_row else ''
+
+        for post in cluster:
+            conn.execute("""
+                INSERT OR IGNORE INTO clusters (campaign_id, post_id, cluster_key)
+                VALUES (?, ?, ?)
+            """, (campaign_id, post['id'], key))
+
+        # Re-roll counts from the (possibly grown) cluster membership.
+        post_count = conn.execute(
+            "SELECT COUNT(*) FROM clusters WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()[0]
+        acct_count = conn.execute("""
+            SELECT COUNT(DISTINCT p.account_id)
+            FROM clusters cl JOIN posts p ON p.id = cl.post_id
+            WHERE cl.campaign_id = ?
+        """, (campaign_id,)).fetchone()[0]
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("""
+            UPDATE campaigns
+            SET last_seen=?, post_count=?, account_count=?, active=1
+            WHERE id=?
+        """, (now, post_count, acct_count, campaign_id))
+
+
+def _dedupe_overlapping_campaigns(min_overlap: float = 0.8) -> int:
+    """
+    Sweep across active campaigns, find pairs whose post sets overlap by
+    ≥ min_overlap (Szymkiewicz–Simpson), and deactivate the lower-confidence
+    member of each pair.  O(n²) on active-campaign count — fine while the
+    table stays under a few hundred rows.
+
+    Returns the number of campaigns deactivated by the sweep.
+    """
+    with db.get_conn() as conn:
+        # Build {campaign_id: set(post_ids)} only for active campaigns.
+        members: dict = {}
+        for row in conn.execute("""
+            SELECT cl.campaign_id, cl.post_id
+            FROM clusters cl JOIN campaigns c ON c.id = cl.campaign_id
+            WHERE c.active = 1
+        """):
+            members.setdefault(row[0], set()).add(row[1])
+
+        if len(members) < 2:
+            return 0
+
+        confs = dict(conn.execute(
+            "SELECT id, confidence_score FROM campaigns WHERE active = 1"
+        ).fetchall())
+        firsts = dict(conn.execute(
+            "SELECT id, first_seen FROM campaigns WHERE active = 1"
+        ).fetchall())
+
+        ids = sorted(members.keys())
+        deactivated: set = set()
+        for i, a in enumerate(ids):
+            if a in deactivated:
+                continue
+            for b in ids[i + 1:]:
+                if b in deactivated:
+                    continue
+                shared = len(members[a] & members[b])
+                denom  = min(len(members[a]), len(members[b]))
+                if denom == 0 or shared / denom < min_overlap:
+                    continue
+
+                # Deactivate the loser.  Confidence wins; ties broken by
+                # first_seen (older campaign retained — preserves continuity).
+                ca, cb = confs.get(a, 0.0), confs.get(b, 0.0)
+                if ca > cb:
+                    loser = b
+                elif cb > ca:
+                    loser = a
+                else:
+                    loser = b if (firsts.get(a, '') <= firsts.get(b, '')) else a
+                conn.execute(
+                    "UPDATE campaigns SET active=0 WHERE id=?", (loser,)
+                )
+                deactivated.add(loser)
+                logger.debug(
+                    "Campaign dedup: #%d absorbed by #%d (%d shared posts)",
+                    loser, (a if loser == b else b), shared
+                )
+
+        return len(deactivated)
 
 
 def _detect_platform(platform: str, time_window: int, min_accounts: int,
@@ -105,14 +261,21 @@ def _detect_platform(platform: str, time_window: int, min_accounts: int,
         if len(unique_accounts) < min_accounts:
             continue
 
-        # Check if this cluster already has an active campaign
+        # Same cluster_key already tracked → just refresh totals.
         rep_sh = cluster_reps[idx]
         if _cluster_already_tracked(rep_sh, platform):
-            # Update existing campaign
             _update_campaign(rep_sh, platform, cluster, unique_accounts)
             continue
 
-        # New campaign
+        # Different cluster_key but ≥80% post overlap with an existing campaign
+        # (rep-post drift between runs creates fresh keys for the same content).
+        post_ids = [p['id'] for p in cluster]
+        overlap_id = _find_overlapping_campaign(post_ids, platform)
+        if overlap_id is not None:
+            _link_posts_to_campaign(overlap_id, cluster, unique_accounts)
+            continue
+
+        # Genuinely new campaign.
         confidence = _confidence_score(cluster, unique_accounts, max_dist)
         _save_campaign(rep_sh, platform, cluster, unique_accounts, confidence)
         new_campaigns += 1
@@ -182,6 +345,13 @@ def _detect_fourchan(platform: str, time_window: int, min_threads: int,
         rep_sh = cluster_reps[idx]
         if _cluster_already_tracked(rep_sh, platform):
             _update_campaign(rep_sh, platform, cluster, unique_threads)
+            continue
+
+        # Same overlap-based dedup as the main detector — see _detect_platform.
+        post_ids = [p['id'] for p in cluster]
+        overlap_id = _find_overlapping_campaign(post_ids, platform)
+        if overlap_id is not None:
+            _link_posts_to_campaign(overlap_id, cluster, unique_threads)
             continue
 
         confidence = _confidence_score(cluster, unique_threads, max_dist)

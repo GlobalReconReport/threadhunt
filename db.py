@@ -206,6 +206,21 @@ def init_db():
         except Exception:
             pass  # index already exists
 
+        # Migration: consolidate accounts.platform='twitter' into 'nitter' to
+        # match posts.platform written by the Nitter collector.  Earlier versions
+        # upserted accounts with platform='twitter' while posts went in with
+        # platform='nitter' — breaking `account-list --platform nitter` and
+        # creating duplicate rows on re-collection once the collector is fixed.
+        # `OR IGNORE` skips any row whose 'nitter' twin already exists, leaving
+        # post.account_id linkage intact (we update in place — id doesn't change).
+        try:
+            conn.execute(
+                "UPDATE OR IGNORE accounts SET platform='nitter' "
+                "WHERE platform='twitter'"
+            )
+        except Exception as e:
+            logger.debug("accounts platform consolidation skipped: %s", e)
+
         # Seed default tracked_accounts roster on first init only.
         existing = conn.execute("SELECT COUNT(*) FROM tracked_accounts").fetchone()[0]
         if existing == 0:
@@ -251,17 +266,22 @@ def upsert_account(conn, username: str, platform: str, **kwargs) -> int | None:
     Returns the account's integer id.
     """
     now = datetime.now(timezone.utc).isoformat()
+    # COALESCE(NULLIF(excluded.X, 0), accounts.X) — preserves previously-good
+    # follower/following/post_count values when a re-collection lands via a
+    # path that doesn't carry profile metadata (Twitter API/syndication paths
+    # would otherwise overwrite real numbers with 0).  bio + profile_pic_hash
+    # already use COALESCE(excluded, existing) for the same reason on NULLs.
     conn.execute("""
         INSERT INTO accounts
             (username, platform, followers, following, post_count,
              profile_pic_hash, bio, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(username, platform) DO UPDATE SET
-            followers        = excluded.followers,
-            following        = excluded.following,
-            post_count       = excluded.post_count,
+            followers        = COALESCE(NULLIF(excluded.followers, 0),  accounts.followers),
+            following        = COALESCE(NULLIF(excluded.following, 0),  accounts.following),
+            post_count       = COALESCE(NULLIF(excluded.post_count, 0), accounts.post_count),
             profile_pic_hash = COALESCE(excluded.profile_pic_hash, profile_pic_hash),
-            bio              = COALESCE(excluded.bio, bio),
+            bio              = COALESCE(NULLIF(excluded.bio, ''),       accounts.bio),
             updated_at       = excluded.updated_at
     """, (
         username, platform,

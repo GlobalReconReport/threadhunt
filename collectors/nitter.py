@@ -197,6 +197,28 @@ def scrape_profile(session, username: str) -> dict:
     return profile
 
 
+def _profile_has_useful_data(profile: dict) -> bool:
+    """
+    True iff the profile dict carries at least one value-bearing field.
+
+    `scrape_profile()` always returns a dict with the username key set, plus
+    bio='', followers=0, following=0 when the page parsed but none of the
+    fields could be located (typical of JS-protected Nitter mirrors that
+    serve a placeholder shell over plain HTTP).  A bare `if not profile` gate
+    sees that as truthy and skips the Playwright fallback — leaving accounts
+    with all-zero stats.  This predicate gates on actual content instead.
+    """
+    if not profile:
+        return False
+    return bool(
+        (profile.get('followers') or 0) > 0
+        or (profile.get('following') or 0) > 0
+        or (profile.get('post_count') or 0) > 0
+        or profile.get('profile_pic_hash')
+        or (profile.get('bio') or '').strip()
+    )
+
+
 def _parse_stat(soup, href_suffix: str) -> int:
     """Extract a stat number from a Nitter profile.
 
@@ -407,20 +429,60 @@ def _tw_api_headers(guest_token: str) -> dict:
     }
 
 
-def _scrape_twitter_api(session, username: str, cap: int) -> list:
+def _profile_from_tw_user(session, user_obj: dict) -> dict:
+    """
+    Build a profile dict (matching scrape_profile's shape) from a Twitter v1.1
+    user object embedded in a tweet payload.  Used to recover follower/pic/bio
+    data when Nitter is unavailable and we end up on Twitter-direct paths.
+    Missing fields are simply omitted — caller uses dict.setdefault() so
+    earlier (Nitter) data wins on conflict.
+    """
+    profile: dict = {}
+    try:
+        followers = int(user_obj.get('followers_count') or 0)
+        following = int(user_obj.get('friends_count') or 0)
+        statuses  = int(user_obj.get('statuses_count') or 0)
+    except (TypeError, ValueError):
+        followers = following = statuses = 0
+
+    if followers: profile['followers']  = followers
+    if following: profile['following']  = following
+    if statuses:  profile['post_count'] = statuses
+
+    bio = (user_obj.get('description') or '').strip()
+    if bio:
+        profile['bio'] = bio
+
+    # Hash the avatar so pic_reuse bot scoring can detect bot-farm overlap.
+    pic_url = (user_obj.get('profile_image_url_https')
+               or user_obj.get('profile_image_url'))
+    if pic_url:
+        try:
+            pr = session.get(pic_url, timeout=5)
+            if pr.status_code == 200 and pr.content:
+                profile['profile_pic_hash'] = hashlib.md5(pr.content).hexdigest()
+        except Exception as e:
+            logger.debug("Twitter avatar hash failed: %s", e)
+
+    return profile
+
+
+def _scrape_twitter_api(session, username: str, cap: int) -> tuple:
     """
     Fallback A: Twitter v1.1 user_timeline with guest token.
-    Returns list of {post_id, content, timestamp} dicts or [] on failure.
+    Returns (posts, profile) — profile is harvested once from the first
+    tweet's embedded `user` object (v1.1 endpoint always returns it).
     Paginates via max_id until cap reached or no more tweets.
     """
     guest_token = _tw_guest_token(session)
     if not guest_token:
         logger.debug("Twitter direct: could not acquire guest token")
-        return []
+        return [], {}
 
     headers = _tw_api_headers(guest_token)
-    posts   = []
-    max_id  = None
+    posts: list = []
+    profile: dict = {}
+    max_id = None
 
     while len(posts) < cap:
         params: dict = {
@@ -456,6 +518,15 @@ def _scrape_twitter_api(session, username: str, cap: int) -> list:
             logger.debug("Twitter direct API error: %s", e)
             break
 
+        # Harvest profile from the first tweet that carries a `user` object.
+        # The v1.1 endpoint embeds it on every tweet; one harvest is enough.
+        if not profile:
+            for tw in tweets:
+                u = tw.get('user')
+                if isinstance(u, dict):
+                    profile = _profile_from_tw_user(session, u)
+                    break
+
         page_new = 0
         for tw in tweets:
             if len(posts) >= cap:
@@ -490,15 +561,17 @@ def _scrape_twitter_api(session, username: str, cap: int) -> list:
         time.sleep(1.0)
 
     logger.info("Twitter direct API: got %d posts for @%s", len(posts), username)
-    return posts
+    return posts, profile
 
 
-def _scrape_twitter_syndication(session, username: str, cap: int) -> list:
+def _scrape_twitter_syndication(session, username: str, cap: int) -> tuple:
     """
     Fallback B: Twitter CDN syndication endpoint used by embedded timelines.
     Less capable than the API (no pagination, ~20 recent tweets) but very
     stable as it's used by Twitter's own embeds on third-party sites.
-    Returns list of {post_id, content, timestamp} dicts or [] on failure.
+    Returns (posts, profile).  Profile harvested from the embedded user
+    object; syndication uses a simpler schema than v1.1 — fields may be at
+    top level (`data['user']`) or per-tweet (`tw['user']`).
     """
     try:
         r = session.get(
@@ -518,20 +591,33 @@ def _scrape_twitter_syndication(session, username: str, cap: int) -> list:
         )
         if r.status_code != 200:
             logger.debug("Twitter syndication: HTTP %d for @%s", r.status_code, username)
-            return []
+            return [], {}
         data = r.json()
     except Exception as e:
         logger.debug("Twitter syndication error: %s", e)
-        return []
+        return [], {}
 
-    posts  = []
+    posts: list = []
+    profile: dict = {}
     tweets = data.get('timeline', data.get('tweets', []))
+
+    # Top-level user object (some syndication shapes put it here)
+    top_user = data.get('user')
+    if isinstance(top_user, dict):
+        profile = _profile_from_tw_user(session, top_user)
+
     for tw in tweets:
         if len(posts) >= cap:
             break
         tw_id = str(tw.get('id_str', tw.get('id', '')))
         if not tw_id:
             continue
+
+        # Per-tweet user fallback (only if top-level didn't yield anything).
+        if not profile:
+            u = tw.get('user')
+            if isinstance(u, dict):
+                profile = _profile_from_tw_user(session, u)
 
         content = (tw.get('full_text') or tw.get('text', '')).strip()
         if not content:
@@ -547,7 +633,7 @@ def _scrape_twitter_syndication(session, username: str, cap: int) -> list:
         posts.append({'post_id': tw_id, 'content': content, 'timestamp': timestamp})
 
     logger.info("Twitter syndication: got %d posts for @%s", len(posts), username)
-    return posts
+    return posts, profile
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -593,17 +679,45 @@ def collect(session, target: str, keyword: str = None, verbose_cb=None) -> int:
         # Ingest under a synthetic account name for keyword searches
         target = f'search:{keyword}'
 
+    # ── Profile metadata (runs once, BEFORE path resolution) ──────────────────
+    # Profile data is independent of which timeline path wins, so we scrape it
+    # up-front and let it carry across all seven paths.  Order: HTTP Nitter →
+    # Playwright Nitter → (later) Twitter API/syndication user_obj harvest.
+    # Keyword-only synthetic targets ('search:...') have no real profile.
+    #
+    # Gate uses _profile_has_useful_data() rather than a truthiness check —
+    # JS-protected Nitter mirrors return a parseable shell with all-zeros
+    # stats, which a `bool(profile)` gate would falsely accept.
+    if target and not target.startswith('search:'):
+        if _instances(session):
+            if verbose_cb:
+                verbose_cb(f"Profile: HTTP Nitter scrape for @{target}")
+            profile = scrape_profile(session, target)
+        if not _profile_has_useful_data(profile) and _PW_AVAILABLE:
+            if verbose_cb:
+                verbose_cb(f"Profile: Playwright fallback for @{target}")
+            all_instances = config.get('nitter_instances', [])
+            try:
+                pw_profile = _pw.scrape_profile_pw(all_instances, target) or {}
+            except Exception as e:
+                logger.debug("Playwright profile scrape error for @%s: %s", target, e)
+                pw_profile = {}
+            # Overwrite (not merge) — HTTP-side zeros are placeholder noise,
+            # not data worth preserving.
+            if _profile_has_useful_data(pw_profile):
+                profile = pw_profile
+
     # ── Path 1: Nitter timeline ───────────────────────────────────────────────
+    # Profile already scraped above — do NOT re-scrape, do NOT reset on empty
+    # timeline.  Profile is carried regardless of which path delivers posts.
     if not raw_posts and target and _instances(session):
         if verbose_cb:
             verbose_cb(f"Nitter: {len(_instances(session))} live — scraping @{target}")
-        profile = scrape_profile(session, target)
         raw_posts = list(scrape_timeline(session, target, cap=cap))
         if raw_posts:
             path_used = 'nitter'
         else:
             logger.info("Nitter timeline: 0 posts from @%s", target)
-            profile = {}
 
     # ── Path 2: Nitter search from:{username} ────────────────────────────────
     if not raw_posts and target and not target.startswith('search:') and _search_capable_instances(session):
@@ -647,20 +761,27 @@ def collect(session, target: str, keyword: str = None, verbose_cb=None) -> int:
             target = f'search:{keyword}'
 
     # ── Path 6: Twitter guest API ─────────────────────────────────────────────
+    # Nitter scrapes (HTTP + Playwright) above may have already populated
+    # `profile`.  setdefault() means existing fields win — API metadata only
+    # fills the gaps for accounts where Nitter is unreachable.
     if not raw_posts and target and not target.startswith('search:'):
         if verbose_cb:
             verbose_cb(f"Nitter failed — trying Twitter guest API for @{target}")
-        raw_posts = _scrape_twitter_api(session, target, cap)
+        raw_posts, api_profile = _scrape_twitter_api(session, target, cap)
         if raw_posts:
             path_used = 'twitter_api'
+            for k, v in (api_profile or {}).items():
+                profile.setdefault(k, v)
 
     # ── Path 7: Twitter syndication CDN ──────────────────────────────────────
     if not raw_posts and target and not target.startswith('search:'):
         if verbose_cb:
             verbose_cb(f"API failed — trying Twitter syndication for @{target}")
-        raw_posts = _scrape_twitter_syndication(session, target, cap)
+        raw_posts, syn_profile = _scrape_twitter_syndication(session, target, cap)
         if raw_posts:
             path_used = 'twitter_syndication'
+            for k, v in (syn_profile or {}).items():
+                profile.setdefault(k, v)
 
     if not raw_posts:
         logger.warning(
@@ -676,12 +797,16 @@ def collect(session, target: str, keyword: str = None, verbose_cb=None) -> int:
     logger.info("Twitter: collecting @%s via %s (%d posts)", target, path_used, len(raw_posts))
 
     # ── Ingest ────────────────────────────────────────────────────────────────
+    # platform='nitter' (not 'twitter') so accounts.platform matches posts.platform
+    # written by db.insert_post below — earlier mismatch broke
+    # `account-list --platform nitter` and the tracked_accounts roster.
     new_count = 0
     with db.get_conn() as conn:
         account_id = db.upsert_account(
-            conn, target, 'twitter',
+            conn, target, 'nitter',
             followers=profile.get('followers', 0),
             following=profile.get('following', 0),
+            post_count=profile.get('post_count', 0),
             profile_pic_hash=profile.get('profile_pic_hash'),
             bio=profile.get('bio', ''),
         )
